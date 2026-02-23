@@ -1,0 +1,6 @@
+memory = "2G"
+vcpu = 2
+
+[[proxy]]
+domain = "registry.npmjs.org"
+mode = "live"

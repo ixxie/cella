@@ -1,0 +1,31 @@
+/target
+*.swp
+result
+.direnv/
+.cella/secrets.env
+
+# Claude Code sandbox artifacts (https://github.com/anthropics/claude-code/issues/17727)
+.claude/commands
+.bash_profile
+.bashrc
+.vscode
+.gitconfig
+.gitmodules
+.idea
+.mcp.json
+.profile
+.ripgreprc
+.zprofile
+.zshrc
+/HEAD
+/config
+/hooks
+/objects
+/refs
+
+
+# Added by cargo
+#
+# already existing elements were commented out
+
+#/target
