@@ -15,14 +15,15 @@ isolation, proxy-enforced network control. Runs on NixOS, deploys from any machi
 - **VM isolation** — each cell is a NixOS microVM; the host filesystem is untouched
 - **Egress filtering** — reads are open, writes are allowlisted by domain and HTTP method
 - **Secret injection** — API keys never enter the VM; the proxy injects credentials into outbound requests
-- **Hardened review gate** — nucleus pre-commit hook reviews diffs via LLM on a separate, restricted proxy
+- **Per-repo egress** — each repo declares its own network rules and credentials
 
 **Workflow:**
 
 - **Git-native** — push, pull, fetch, and merge between host and cells using standard git
-- **Detachable sessions** — tmux-backed shell sessions persist across disconnects
+- **Flow engine** — middleware hook system (pre/handle/post) with agent-driven transitions
+- **Transition params** — ops pass structured data through the flow via `$OP_PARAMS`
+- **In-VM services** — `cellx service` manages background processes (dev servers) across ops
 - **Dev server tunneling** — `cella tunnel` forwards ports with per-cell DNS (`feat.myapp.cell`)
-- **Lifecycle hooks** — run commands (e.g. `bun install`) automatically after code is pushed
 
 **Operations:**
 
@@ -30,6 +31,7 @@ isolation, proxy-enforced network control. Runs on NixOS, deploys from any machi
 - **Remote-transparent** — all commands work identically on local and remote hosts via SSH
 - **Deploy from anywhere** — `cella deploy` provisions NixOS on any VPS
 - **Composable VM config** — server-level and per-repo flakes with custom inputs are merged at cell creation
+- **Default server** — configurable at client or repo level, no `-s` flag needed
 
 ## Getting started
 
@@ -58,8 +60,10 @@ support, and passwordless sudo for tunnel operations:
 cella.client = {
   enable = true;
   user = "me";
-  vmConfig = ./vm;                          # cell base config for localhost
-  servers.prod = "root@1.2.3.4";            # server registry
+  server = "prod";                             # default server for all repos
+  vmConfig = ./vm;                             # cell base config for localhost
+  servers.prod = "root@1.2.3.4";               # server registry
+  sync = ["~/.claude.json"];                   # files synced into remote cells
 };
 ```
 
@@ -96,61 +100,65 @@ standalone server repos.
 }
 ```
 
-`cella deploy` is an optional convenience for deploying standalone server
-repos — see [Deployment](#deployment).
+For standalone server repos, `cella.lib.mkHost` provides a minimal wrapper:
+
+```nix
+cella.lib.mkHost { inherit cella nixpkgs disko; } {
+  name = "myhost";
+  disk = ./disk.nix;
+  sshPubkey = "ssh-ed25519 AAAA...";
+}
+```
 
 ### Configuration
 
 Per-repo config lives in `.cella/config.toml`:
 
 ```toml
-ports = [5173, 8001]
+memory = "4096M"
+vcpu = 2
+server = "prod"                   # default server (overrides client default)
+ports = [5173]
 post_push = "bun install"
-shell_timeout = 600
 
-[session]
-hooks = [".cella/hooks/rate-limit.sh"]
+[secrets]
+recipient = "ssh-ed25519 AAAA..."
 
-[nucleus]
-command = "claude --print -s 'Review this diff for security issues'"
+[egress]
+writes.allowed = ["opencode.ai", "api.linear.app"]
+
+[[egress.credentials]]
+host = "opencode.ai"
+header = "Authorization"
+env_var = "OPENCODE_API_KEY"
+
+[[egress.credentials]]
+host = "api.linear.app"
+header = "Authorization"
+env_var = "LINEAR_API_KEY"
 ```
+
+Server resolution order: CLI `-s` flag > repo `server` > client `server` > scan running cells > localhost.
 
 #### VM configuration
 
 Guest VM customization uses flakes that export a `nixosModule`. This lets
-you bring in arbitrary flake inputs (e.g. claude-code, custom tools).
+you bring in arbitrary flake inputs (e.g. opencode, custom tools).
 
 **Server-level** — a `vm/` directory alongside the server config, deployed
 to `/var/lib/cella/vm-config/`. For localhost, set `vmConfig` in the client
-module. For remote servers, `cella deploy` copies it automatically.
-
-`vm/flake.nix`:
-
-```nix
-{
-  inputs.claude-code.url = "github:anthropics/claude-code";
-
-  outputs = { claude-code, ... }: {
-    nixosModule = { pkgs, ... }: {
-      environment.systemPackages = [
-        pkgs.helix
-        claude-code.packages.${pkgs.stdenv.hostPlatform.system}.default
-      ];
-    };
-  };
-}
-```
+module.
 
 **Per-repo** (`.cella/flake.nix`) — applies to cells for that repo:
 
 ```nix
 {
-  inputs.some-tool.url = "github:foo/bar";
+  inputs.opencode.url = "github:anomalyco/opencode/dev";
 
-  outputs = { some-tool, ... }: {
+  outputs = { opencode, ... }: {
     nixosModule = { pkgs, ... }: {
       environment.systemPackages = [
-        some-tool.packages.${pkgs.stdenv.hostPlatform.system}.default
+        opencode.packages.${pkgs.stdenv.hostPlatform.system}.default
       ];
     };
   };
@@ -161,14 +169,22 @@ Both are optional and merged at cell creation time.
 
 ### Secrets
 
-Cella manages secrets so they never enter the VM. Two methods:
+Cella manages secrets so they never enter the VM. The proxy reads
+`/var/lib/cella/secrets.env` and injects credentials into outbound
+requests based on the egress credential rules.
 
 **Built-in age encryption** (default) — encrypt secrets into your repo:
 
 ```bash
-echo "ANTHROPIC_API_KEY=sk-..." > .cella/secrets.env
-cella secrets encrypt -r "ssh-ed25519 AAAA..."
-cella secrets edit -r "ssh-ed25519 AAAA..."
+cella secrets edit                  # decrypt, edit, re-encrypt
+cella secrets encrypt               # encrypt .cella/secrets.env
+```
+
+Set the recipient once in `.cella/config.toml`:
+
+```toml
+[secrets]
+recipient = "ssh-ed25519 AAAA..."
 ```
 
 The encrypted `.cella/secrets.age` is committed to the repo.
@@ -184,33 +200,31 @@ command = "sops -d .cella/secrets.yaml"
 
 The command must output `KEY=VALUE` lines to stdout.
 
-Host-level NixOS module config:
+#### Credential injection
+
+Credentials are injected per-host at the proxy level. Configure them
+at the repo level in `.cella/config.toml`:
+
+```toml
+[[egress.credentials]]
+host = "api.anthropic.com"
+header = "x-api-key"
+env_var = "ANTHROPIC_API_KEY"
+```
+
+Or at the server level in the NixOS config:
 
 ```nix
-cella.server = {
-  enable = true;
-  nat.interface = "wlp1s0";
-
-  egress = {
-    writes.allowed = [
-      "api.anthropic.com"
-      "*.anthropic.com"
-    ];
-    credentials = [{
-      host = "api.anthropic.com";
-      header = "x-api-key";
-      envVar = "ANTHROPIC_API_KEY";
-    }];
-  };
-
-  credentialsFile = "/run/secrets/cella-env";
-  nucleus.enable = true;
-
-  vm.mounts = {
-    "/home/me/.ssh" = { mountPoint = "/home/me/.ssh"; readOnly = true; };
-  };
-};
+cella.server.egress.credentials = [{
+  host = "api.anthropic.com";
+  header = "x-api-key";
+  envVar = "ANTHROPIC_API_KEY";
+}];
 ```
+
+Repo-level credentials are merged with server-level ones. The proxy
+reads the env var from `secrets.env` (or the process environment) and
+injects it as the specified header on matching requests.
 
 ### Deployment
 
@@ -220,28 +234,18 @@ Deploy a standalone server repo to any VPS:
 
 ```bash
 cd ~/repos/servers/prod
-cella deploy
+cella server deploy
 ```
 
-Reads the target from the server registry, config from the current directory.
 Auto-detects the target OS:
 
 - **Already NixOS** — updates in place via `nixos-rebuild`
-- **Not NixOS** — bootstraps via nixos-anywhere (uses docker/podman if nix isn't installed locally)
-
-If a `vm/` directory exists alongside the server config, it's deployed
-to `/var/lib/cella/vm-config/` on the remote.
+- **Not NixOS** — bootstraps via nixos-anywhere
 
 #### Local
 
 On a NixOS machine, import the cella modules in your system flake
-and run cells locally:
-
-```bash
-cella init                        # scaffold .cella/
-cella server use localhost        # use local server
-cella shell feat                  # creates branch, boots VM, attaches
-```
+and run cells locally.
 
 ## Usage
 
@@ -249,26 +253,27 @@ All commands run from inside a git repo. Each cell is a branch that gets
 its own isolated VM with the repo mounted at `/<repo-name>`.
 
 ```bash
-cella shell feat              # create branch + boot + attach (the one verb)
-cella shell feat -c "make"    # run a command non-interactively
-cella shell feat -s work      # named session (reattachable)
-# Ctrl+] to detach            # session persists via tmux
-# Ctrl+c to exit              # session is destroyed
+cella run dev -c feat              # create branch, boot VM, start flow
+cella run dev -a                   # attach to flow output
+cella run dev -- project="my app"  # pass params to the start op
 
-cella kill feat               # force stop VM
-cella kill feat -d            # force stop + delete branch and clone
-cella list                    # list cells, sessions, autostop countdown
+cella shell feat                   # SSH into a cell
+cella shell feat -c "make"         # run a command non-interactively
+
+cella stop feat                    # stop flow + cell
+cella stop feat -d                 # stop + delete branch and clone
+cella list                         # list cells and their status
+cella logs feat -f                 # follow flow output
+cella status feat                  # show flow state
+cella pause feat                   # pause flow, cell stays up
 ```
-
-Cells auto-stop when all tmux sessions are closed. The timeout is
-configurable via `shell_timeout` in `.cella/config.toml` (default 300s).
 
 Interact with agent work from the host through standard git:
 
 ```bash
-git fetch cella               # fetch agent's commits
-git diff cella/feat           # review changes
-git pull cella feat           # merge into current branch
+git fetch cella                    # fetch agent's commits
+git diff cella/feat                # review changes
+git pull cella feat                # merge into current branch
 ```
 
 ### Dev servers
@@ -281,75 +286,248 @@ cella tunnel feat -p 5173 -p 8001-8004   # multiple ports and ranges
 cella tunnel feat -p 5173 -o             # open in browser
 ```
 
-Each cell gets a unique loopback IP, so `http://feat.myapp.cell:5173` won't
-conflict with a local dev server on the same port. The tunnel auto-reconnects
-if the connection drops.
+### Flow engine
 
-Ports can also be declared in config (used when no `-p` flags are given):
+The flow engine runs a middleware hook system inside the VM. Define ops
+with prompts and hook scripts that control transitions.
 
-```toml
-ports = [5173, 8001]
+```
+.cella/flows/dev/
+  flow.toml           # start op, rules, max_retries
+  handle.sh           # flow-level handle (the harness — e.g. opencode)
+  pre.sh              # flow-level pre hook (optional)
+  ops/
+    implement/
+      op.md            # YAML frontmatter + prompt body
+      post.sh          # transition logic
+    validate/
+      op.md
+      handle.sh        # op-level override (e.g. run tests instead of agent)
+      post.sh
 ```
 
-### Lifecycle hooks
-
-`post_push` runs inside the VM after code is pushed:
+#### flow.toml
 
 ```toml
-post_push = "bun install"
+[flow]
+start = "dispatch"
+max_retries = 10
+
+[rules.no-test-write]
+files.denied = ["tests/**"]
 ```
 
-### Session hooks
+#### op.md
 
-Long-running scripts that monitor tmux sessions. Each hook gets a
-`session` command on PATH with `read` and `send` subcommands:
+YAML frontmatter + markdown prompt body:
 
-```toml
-[session]
-command = "claude --dangerously-skip-permissions -p 'Build the project'"
-on_exit = "scripts/cleanup.sh"
-hooks = [".cella/hooks/rate-limit.sh"]
+```yaml
+---
+name: implement
+next:
+  - implement
+  - validate
+params:
+  model: opencode/claude-sonnet-4-6
+---
+
+Implement the current task. The task details are in $OP_PARAMS.
+Run `bun run check` to verify the code compiles.
 ```
 
-- `command` — replaces the default shell (for headless agent sessions)
-- `on_exit` — runs when the session ends
-- `hooks` — background scripts started with each session
+Frontmatter fields:
 
-Example hook (`.cella/hooks/rate-limit.sh`):
+| Field | Purpose |
+|---|---|
+| `name` | Op identifier |
+| `next` | Valid transitions (enforced) |
+| `rules` | Rule names to activate |
+| `on` | Lifecycle hook: `success`, `failure`, `finish` |
+| `params` | Key-value pairs → `PARAM_*` env vars |
 
-```bash
+#### Hooks (middleware model)
+
+Each op runs through a middleware onion:
+
+```
+flow/pre.sh → op/pre.sh → handle.sh → op/post.sh → flow/post.sh
+```
+
+- **pre** — setup (compose: both flow and op level run)
+- **handle** — execute the work (override: op replaces flow)
+- **post** — decide transition (compose: both run)
+
+Resolution:
+
+| Hook | Resolution | Required |
+|---|---|---|
+| `pre.sh` | op ?? flow ?? noop | No |
+| `handle.sh` | op ?? flow | Yes (flow-level) |
+| `post.sh` | op ?? flow ?? noop | No |
+
+Hooks use shebangs for interpreter choice — no `command` field needed:
+
+```sh
+#!/usr/bin/env python3
+# this handle.sh runs python
+```
+
+#### Environment variables
+
+Hooks receive context via env vars:
+
+| Variable | Scope | Description |
+|---|---|---|
+| `FLOW_NAME` | flow | Flow name |
+| `FLOW_DIR` | flow | Flow directory path |
+| `FLOW_STATE_DIR` | flow | Flow run state directory |
+| `OP_NAME` | op | Current op name |
+| `OP_WORKSPACE` | op | Per-invocation workspace directory |
+| `OP_PROMPT` | op | Op body from op.md |
+| `OP_PARAMS` | op | JSON params from transition |
+| `OP_EXIT_CODE` | post | Handle exit code (post hooks only) |
+| `OP_DURATION` | op | Elapsed seconds |
+| `PARAM_*` | op | From op.md frontmatter params |
+
+#### Transitions
+
+Post hooks call `cellx flow` to decide what happens next:
+
+```sh
 #!/bin/sh
-while true; do
-  content=$(session read)
-  if echo "$content" | grep -q "limit reached"; then
-    # parse reset time, wait, then continue
-    sleep 300
-    session send "continue"
-  fi
-  sleep 10
-done
+if [ "$OP_EXIT_CODE" -eq 0 ]; then
+  cellx flow to validate --params '{"scenario": "SC-1"}'
+else
+  cellx flow retry
+fi
 ```
 
-### Logs
+| Command | Effect |
+|---|---|
+| `cellx flow to <op> [--params JSON]` | Transition (must be in `next` list) |
+| `cellx flow retry [--after 30m]` | Rerun current op |
+| `cellx flow pause` | Pause flow (cell stays up) |
+| `cellx flow done` | End the flow |
+
+If no decision is made (no `result.json` in workspace), the flow fails.
+Retries are capped by `max_retries` (default: 10).
+
+#### Per-op workspace
+
+Each op invocation gets its own workspace directory:
+
+```
+/var/lib/cellx/state/
+  {flow}-{timestamp}/
+    flow.json
+    {op}-{timestamp}/
+      result.json
+      (any artifacts hooks write)
+```
+
+The workspace path is in `$OP_WORKSPACE`. Workspaces persist for
+debugging and audit. Each retry creates a new workspace.
+
+#### Lifecycle ops
+
+Ops with `on:` run after the main loop exits:
+
+```yaml
+---
+name: preview
+on: success
+---
+
+cellx service start preview 'bun run dev --host 0.0.0.0'
+```
+
+| `on` value | When it runs |
+|---|---|
+| `success` | Flow completed via `done` |
+| `failure` | Flow exited with an error |
+| `finish` | Always |
+
+#### In-VM services
 
 ```bash
-cella logs              # tail client log
-cella logs -f           # follow
-cella logs --server     # tail server log (via SSH)
+cellx service start <name> <cmd>   # start background process
+cellx service stop <name>          # stop
+cellx service restart <name>       # restart (reuses previous cmd)
+cellx service logs <name> [-f]     # view logs
+cellx service list                 # show running services
 ```
 
-### Servers
+#### Rules
 
-Manage the server registry:
+Rules control what the agent can access during each op.
+
+**Server** — the NixOS egress config is `server:default`:
+
+```nix
+cella.server.egress = {
+  reads.allowed = "*";
+  writes.allowed = ["github.com" "*.github.com"];
+  writes.denied = "*";
+};
+```
+
+**Cell** — `.cella/config.toml`:
+
+```toml
+[egress]
+writes.allowed = ["opencode.ai", "api.linear.app"]
+```
+
+**Flow** — `flow.toml`:
+
+```toml
+[rules.llm-only]
+writes.allowed = ["api.anthropic.com"]
+writes.denied = ["*"]
+```
+
+Rules compose via `extends` and field-level references. See the
+rule composition table below.
+
+| Pattern | Meaning |
+|---|---|
+| `extends = ["server:default"]` | Start from server baseline |
+| `writes.denied = ["cell:strict", "*.evil.com"]` | Merge entries from another rule + literals |
+| Op with `rules` omitted | Inherits `server:default` |
+| Op with `rules = []` | No restrictions |
+
+#### Example: dev flow
+
+A complete development flow that reads tasks from Linear, implements
+them with an AI agent, validates with tests, and fixes failures:
+
+```
+.cella/flows/dev/
+  flow.toml
+  handle.sh               # opencode harness
+  pre.sh                  # bun install
+  ops/
+    dispatch/              # query Linear, pick next scenario
+      op.md
+      post.sh              # → implement or done
+    implement/             # agent codes the task
+      op.md
+      post.sh              # → implement (next issue) or validate
+    validate/              # build + playwright
+      op.md
+      handle.sh            # override: run tests, not agent
+      post.sh              # → dispatch (pass) or fix (fail)
+    fix/                   # agent fixes failures
+      op.md
+      post.sh              # → validate
+    preview/               # start dev server on success
+      op.md
+      handle.sh
+```
 
 ```bash
-cella server add prod root@1.2.3.4     # register a server
-cella server remove prod                # unregister
-cella server list                       # show all servers
-cella server use prod                   # set active server for this repo
+cella run dev -c blog -- project="personal blog"
 ```
-
-NixOS users can declare servers in the client module instead.
 
 ## Anatomy
 
@@ -357,20 +535,14 @@ The **proxy** is the core security boundary. It sits between the cell and
 the internet, injecting credentials into outbound requests and filtering
 egress by HTTP method and domain. Secrets never enter the VM.
 
-The **nucleus** is an independent review layer. When the agent commits code,
-a pre-commit hook sends the diff to an LLM running through a separate proxy
-that can only reach the LLM API — no web access, no injection surface.
-
 ```mermaid
 %%{init: {'theme': 'dark', 'themeVariables': {'actorBkg': '#1a1a2e', 'actorTextColor': '#eee', 'actorBorder': '#444', 'signalColor': '#ccc', 'signalTextColor': '#ccc', 'noteBkgColor': '#2a2a3e', 'noteTextColor': '#eee', 'noteBorderColor': '#555'}}}%%
 sequenceDiagram
     box rgb(30,60,30) MicroVM
         participant Cell
-        participant Nucleus
     end
     box rgb(20,40,80) Host
-        participant Proxy as Cell Proxy
-        participant NProxy as Nucleus Proxy
+        participant Proxy
     end
     box rgb(60,50,10) External
         participant Internet
@@ -388,13 +560,6 @@ sequenceDiagram
 
     Cell-xProxy: POST blocked domain
     Note right of Proxy: 403 Blocked
-
-    Cell->>Nucleus: git commit
-    Nucleus->>NProxy: review diff via LLM
-    NProxy->>Internet: LLM API only
-    Internet-->>NProxy: review result
-    NProxy-->>Nucleus: approve / reject
-    Nucleus-->>Cell: commit accepted
 ```
 
 ## Threat model
@@ -405,140 +570,68 @@ communicate externally — pose a serious security risk. Any two of these are
 manageable; all three enable exfiltration. Cella ensures the three never
 coexist inside a cell.
 
-Beyond exfiltration, agents pose additional risks to the host system and
-codebase integrity that cella addresses independently.
-
 ### Secret exfiltration
 
-**Threat:** A prompt injection hidden in web content, documentation, or
-dependency metadata instructs the agent to read API keys from its
-environment and send them to an attacker-controlled endpoint.
+**Threat:** A prompt injection instructs the agent to read API keys and
+send them to an attacker-controlled endpoint.
 
-**Defense:** Secrets never enter the cell. The proxy intercepts outbound
-requests and injects credentials (API keys, tokens) into the appropriate
-headers on the fly. Inside the VM, there are no environment variables,
-files, or config containing secrets. Even if the agent is fully compromised
-by a prompt injection, there is nothing to exfiltrate.
-
-Write access is further restricted by an egress allowlist. The agent can
-only POST/PUT/PATCH/DELETE to domains you explicitly permit. An injected
-prompt cannot phone home because the proxy blocks the request. Reads
-(GET/HEAD/OPTIONS) are unrestricted — prompt injection via content is
-harmless when there are no secrets to steal and no channel to exfiltrate
-through.
+**Defense:** Secrets never enter the cell. The proxy injects credentials
+into outbound requests on the fly. Inside the VM, there are no environment
+variables, files, or config containing secrets. Write access is restricted
+by an egress allowlist — the agent can only POST to domains you explicitly
+permit.
 
 ### Filesystem damage
 
 **Threat:** The agent modifies host files, installs persistent malware,
-corrupts system state, or alters other projects on the machine.
+or corrupts system state.
 
 **Defense:** Each cell is a NixOS microVM with its own isolated filesystem.
-The repository is mounted via VirtioFS — the agent can modify the repo
-contents but has no access to the host filesystem. The nix store is shared
-read-only for performance. There is no sudo, no root access, and `/tmp`
-is capped at 1GB. If a cell is compromised, `cella delete` wipes it completely.
-
-### Backdoor injection
-
-**Threat:** The agent commits malicious code — a backdoor, a dependency
-substitution, or a subtle logic change — that slips through human review.
-
-**Defense:** The nucleus is a pre-commit hook that intercepts every
-`git commit` inside the cell. It sends the diff to an LLM reviewer running
-through a separate proxy that can *only* reach the LLM API. The reviewer
-has no web access, no ability to be prompt-injected via external content,
-and no access to the cell's network. It evaluates the diff in isolation
-and can reject the commit before it's recorded.
-
-The nucleus proxy is intentionally more restricted than the cell proxy —
-it allows a single API endpoint and nothing else. This separation ensures
-the reviewer cannot be influenced by the same content that may have
-compromised the agent.
+The repository is mounted via VirtioFS — the agent can modify repo contents
+but has no access to the host filesystem. There is no sudo, no root access.
+`cella stop -d` wipes a cell completely.
 
 ## NixOS module effects
 
 Both modules are opt-in (`enable = true`) and only modify the system when
-explicitly enabled. This section documents every system-level change so you
-can audit before importing.
+explicitly enabled.
 
 ### Server module (`cella.nixosModules.server`)
 
-The server module runs on the machine that hosts cell VMs. It creates:
-
 **Network:**
-- A bridge interface (`cellabr` on `192.168.83.0/24`) for VM networking
-- systemd-networkd config to attach VM tap devices to the bridge
-- NAT masquerading for proxy outbound traffic
-- `net.ipv4.ip_forward = 1`
+- Bridge interface (`cellabr` on `192.168.83.0/24`)
+- systemd-networkd for VM tap devices
+- NAT masquerading, `net.ipv4.ip_forward = 1`
 
 **Firewall (nftables):**
-- Forward chain with default-drop policy — cells can only reach:
-  - The HTTP proxy (port 8080)
-  - The git credential service (port 8081)
-  - The nucleus proxy (port 8083, if enabled)
-  - Host SSH (port 22)
-- All other outbound traffic from cells is blocked
-- The bridge interface is added to `trustedInterfaces`
+- Default-drop for cells — only proxy (8080), git credentials (8081), SSH (22)
 
 **DNS:**
-- dnsmasq on the bridge interface (`192.168.83.1`) serving `.cell` hostnames
-- Reads from `/var/lib/cella/dns-hosts` (dynamically updated as cells start/stop)
-- Only listens on the bridge — does not affect host DNS resolution
+- dnsmasq on bridge serving `.cell` hostnames
+- Only listens on bridge — does not affect host DNS
 
 **Services:**
-- `cella-mitmproxy` — MITM proxy for egress filtering and credential injection
-- `cella-ca-sync` — extracts the mitmproxy CA public cert for guest trust
-- `cella-nucleus-proxy` — restricted proxy for nucleus LLM review (if enabled)
-- `cella-services` — control API for cell lifecycle (boot, stop, list)
-- `cella-sweep` — timer that runs every 60s to auto-stop idle cells
-- `cella-hostkey` — generates SSH keypair for server-side VM access (sweep, session counting)
-
-**Proxy:**
-- `egress.passthrough` domains bypass TLS interception (for OAuth flows)
-- Traffic to passthrough domains is forwarded without MITM — real TLS end-to-end
+- `cella-mitmproxy` — egress filtering + credential injection
+- `cella-services` — control API (flow start/stop, cell lifecycle)
+- `cella-ca-sync` — mitmproxy CA cert extraction
+- `cella-hostkey` — SSH keypair for server-side VM access
 
 **Filesystem:**
-- `/var/lib/cella/` — cells, IP pool, DNS hosts, CA certs, proxy config, SSH keys
-- `/var/log/cella/` — proxy and cella service logs
-- `/etc/cella/host-config.json` — host configuration read by cell VMs
-- `/etc/cella/proxy-config.json` — proxy configuration
-
-**Other:**
-- `programs.git` enabled with `safe.directory = *` (for cell repo access)
-- Sudo rules for `systemctl start/stop microvm@*`
-- microvm.nix host module (imported transitively)
+- `/var/lib/cella/` — cells, IP pool, DNS hosts, CA certs, secrets
+- `/var/log/cella/` — proxy and service logs
 
 ### Client module (`cella.nixosModules.client`)
 
-The client module is optional and runs on developer machines. It provides
-convenience features that can also be set up manually.
-
 **`/etc/hosts`:**
-- Sets `environment.etc.hosts.mode = "0644"` so `/etc/hosts` is a writable
-  copy instead of a read-only nix store symlink. This lets `cella tunnel`
-  add `.cell` hostname entries at runtime. Entries are tagged with
-  `# cella-tunnel` and cleaned up when the tunnel closes. A `nixos-rebuild`
-  resets `/etc/hosts` to the declared state.
+- Writable mode so `cella tunnel` can add `.cell` entries at runtime
 
-**Server registry:**
-- Writes `~/.config/cella/servers.toml` from the `servers` option via an
-  activation script
+**Config files:**
+- `~/.config/cella/servers.toml` from `servers` option
+- `~/.config/cella/config.toml` from `server` and `sync` options
 
 **VM config (localhost):**
-- If `vmConfig` is set, copies the directory to `/var/lib/cella/vm-config/`
-  for use by locally-running cells
-
-**Client config:**
-- Writes `~/.config/cella/config.toml` from the `sync` option
-- `sync` lists files to copy into remote cells on entry (e.g. `~/.claude.json`)
+- Copies `vmConfig` to `/var/lib/cella/vm-config/`
 
 **Sudo rules (passwordless):**
-- `ip addr add/del 127.*/8 dev lo` — loopback aliases for tunnel port binding
-- `cella hosts add/remove` — scoped `/etc/hosts` manipulation (only touches
-  lines tagged `# cella-tunnel`)
-
-**Tmpfiles:**
-- `/run/cella/` directory (runtime state)
-
-The client module does **not** install dnsmasq, modify DNS resolution, or
-change NetworkManager/systemd-resolved configuration.
+- `ip addr add/del 127.*/8 dev lo` — loopback aliases for tunnels
+- `cella hosts add/remove` — `/etc/hosts` manipulation

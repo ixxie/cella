@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use tracing::{info, warn, instrument};
 
@@ -139,6 +139,19 @@ fn generate_flake(name: &str, ip: &str, repo_name: &str) -> Result<()> {
     );
 
     std::fs::write(flake_dir.join("flake.nix"), flake)?;
+
+    // resolve latest versions of all inputs
+    let status = Command::new("nix")
+        .args([
+            "--extra-experimental-features", "nix-command flakes",
+            "flake", "update", "--flake", &flake_dir.to_string_lossy(),
+        ])
+        .status()
+        .context("nix flake update failed")?;
+    if !status.success() {
+        anyhow::bail!("failed to update flake inputs for cell '{name}'");
+    }
+
     Ok(())
 }
 
@@ -161,9 +174,9 @@ fn json_to_nix(val: &serde_json::Value) -> String {
     }
 }
 
-// Session counting
+// SSH helpers
 
-fn ssh_target(name: &str) -> Result<(String, String)> {
+pub fn ssh_target(name: &str) -> Result<(String, String)> {
     let rt = runtime_dir(name);
     let ip = std::fs::read_to_string(rt.join("ip"))
         .context("VM not running (no ip file)")?
@@ -177,192 +190,6 @@ fn ssh_target(name: &str) -> Result<(String, String)> {
         format!("{user}@{ip}")
     };
     Ok((ip, target))
-}
-
-#[instrument]
-pub fn count_sessions(name: &str) -> Result<usize> {
-    let (_, target) = ssh_target(name)?;
-    let output = Command::new("ssh")
-        .args([
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "UserKnownHostsFile=/dev/null",
-            "-o", "LogLevel=ERROR",
-            "-o", "ConnectTimeout=3",
-            &target,
-            "tmux list-sessions 2>/dev/null | wc -l",
-        ])
-        .output()
-        .context("ssh session count failed")?;
-    if !output.status.success() {
-        anyhow::bail!("ssh to VM failed (exit {})", output.status);
-    }
-    let count: usize = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse()
-        .unwrap_or(0);
-    Ok(count)
-}
-
-#[derive(Debug)]
-pub struct SessionInfo {
-    pub name: String,
-    pub attached: bool,
-    pub windows: usize,
-    pub created: String,
-}
-
-pub fn list_sessions(name: &str) -> Result<Vec<SessionInfo>> {
-    let (_, target) = ssh_target(name)?;
-    let output = Command::new("ssh")
-        .args([
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "UserKnownHostsFile=/dev/null",
-            "-o", "LogLevel=ERROR",
-            "-o", "ConnectTimeout=3",
-            &target,
-            "tmux list-sessions -F '#{session_name}|#{session_attached}|#{session_windows}|#{session_created}' 2>/dev/null",
-        ])
-        .output()
-        .context("ssh list-sessions failed")?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let sessions = stdout
-        .lines()
-        .filter(|l| !l.is_empty())
-        .filter_map(|line| {
-            let parts: Vec<&str> = line.split('|').collect();
-            if parts.len() >= 4 {
-                Some(SessionInfo {
-                    name: parts[0].to_string(),
-                    attached: parts[1] == "1",
-                    windows: parts[2].parse().unwrap_or(1),
-                    created: parts[3].to_string(),
-                })
-            } else {
-                None
-            }
-        })
-        .collect();
-    Ok(sessions)
-}
-
-// Autostop state management
-//
-// autostop.at   — unix timestamp when the cell should be stopped
-// autostop.timeout — configured timeout in seconds (written at boot or shell exit)
-//
-// The sweep command is the authority: it writes autostop.at when it first
-// sees zero sessions, and stops the cell when the timestamp expires.
-// Shell exit writes autostop.at as a fast-path hint so the first sweep
-// doesn't have to wait a full cycle to start the countdown.
-
-fn autostop_at_file(name: &str) -> PathBuf {
-    runtime_dir(name).join("autostop.at")
-}
-
-fn autostop_timeout_file(name: &str) -> PathBuf {
-    runtime_dir(name).join("autostop.timeout")
-}
-
-/// Write the configured timeout so sweep can read it
-pub fn write_autostop_timeout(name: &str, timeout: u64) {
-    if let Err(e) = std::fs::write(autostop_timeout_file(name), timeout.to_string()) {
-        warn!(error = %e, "failed to write autostop timeout");
-    }
-}
-
-/// Read the configured timeout (defaults to 300s if missing)
-pub fn read_autostop_timeout(name: &str) -> u64 {
-    std::fs::read_to_string(autostop_timeout_file(name))
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(300)
-}
-
-/// Mark that the cell should auto-stop after `timeout` seconds from now
-pub fn mark_autostop(name: &str, timeout: u64) {
-    let stop_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() + timeout)
-        .unwrap_or(0);
-    if let Err(e) = std::fs::write(autostop_at_file(name), stop_at.to_string()) {
-        warn!(error = %e, "failed to mark autostop");
-    }
-}
-
-/// Clear a pending autostop (e.g. when a session is entered)
-pub fn clear_autostop(name: &str) {
-    std::fs::remove_file(autostop_at_file(name)).ok(); // may not exist
-}
-
-/// Returns seconds remaining until autostop, or None
-pub fn autostop_remaining(name: &str) -> Option<u64> {
-    let at_str = std::fs::read_to_string(autostop_at_file(name)).ok()?;
-    let stop_at: u64 = at_str.trim().parse().ok()?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-    if stop_at > now {
-        Some(stop_at - now)
-    } else {
-        Some(0)
-    }
-}
-
-/// Sweep all running cells: schedule or execute autostop as needed.
-/// Called by `cella sweep` on a timer.
-#[instrument]
-pub fn sweep() -> Result<Vec<(String, SweepAction)>> {
-    let mut actions = Vec::new();
-    let cells = list_cells().unwrap_or_default();
-
-    for name in &cells {
-        if !is_running(name).unwrap_or(false) {
-            continue;
-        }
-
-        let sessions = count_sessions(name).unwrap_or(1);
-        let timeout = read_autostop_timeout(name);
-
-        if sessions > 0 {
-            // active sessions — clear any pending autostop
-            if autostop_remaining(name).is_some() {
-                clear_autostop(name);
-                actions.push((name.clone(), SweepAction::Cancelled));
-            }
-            continue;
-        }
-
-        // zero sessions
-        match autostop_remaining(name) {
-            None => {
-                // first observation — start the countdown
-                mark_autostop(name, timeout);
-                actions.push((name.clone(), SweepAction::Scheduled(timeout)));
-            }
-            Some(0) => {
-                // timer expired — stop the cell
-                if let Err(e) = stop(name) {
-                    warn!(error = %e, cell = %name, "sweep failed to stop cell");
-                }
-                clear_autostop(name);
-                actions.push((name.clone(), SweepAction::Stopped));
-            }
-            Some(remaining) => {
-                actions.push((name.clone(), SweepAction::Waiting(remaining)));
-            }
-        }
-    }
-
-    Ok(actions)
-}
-
-#[derive(Debug)]
-pub enum SweepAction {
-    Scheduled(u64),
-    Waiting(u64),
-    Stopped,
-    Cancelled,
 }
 
 // VM lifecycle
@@ -386,9 +213,6 @@ pub fn start(name: &str, repo_name: &str, config: &CellaConfig) -> Result<()> {
 
     let ip = cell::allocate_ip(name)?;
     info!(ip = %ip, "allocated IP");
-
-    // write autostop timeout for sweep
-    write_autostop_timeout(name, config.shell_timeout);
 
     // generate wrapper flake
     generate_flake(name, &ip, repo_name)?;
@@ -508,37 +332,14 @@ pub fn delete(name: &str) -> Result<()> {
     Ok(())
 }
 
-#[instrument(skip(session_cfg))]
+#[instrument]
 pub fn shell(
     name: &str,
-    session: Option<&str>,
     command: Option<&str>,
-    session_cfg: Option<&crate::config::SessionConfig>,
 ) -> Result<()> {
-    // if no session config provided, try loading from the cell's repo
-    let loaded_cfg = if session_cfg.is_none() {
-        let repo_dir = cell_repo_dir(name);
-        crate::config::load(&repo_dir).ok()
-    } else {
-        None
-    };
-    let session_cfg = session_cfg.or(loaded_cfg.as_ref().map(|c| &c.session));
+    let (_, target) = ssh_target(name)?;
 
-    let rt = runtime_dir(name);
-    let ip = std::fs::read_to_string(rt.join("ip"))
-        .context("VM not running (no ip file)")?
-        .trim()
-        .to_string();
-
-    let ssh_user = std::fs::read_to_string(rt.join("user"))
-        .unwrap_or_default().trim().to_string();
-    let ssh_target = if ssh_user.is_empty() {
-        ip.clone()
-    } else {
-        format!("{ssh_user}@{ip}")
-    };
-
-    let repo_name = std::fs::read_to_string(rt.join("repo"))
+    let repo_name = std::fs::read_to_string(runtime_dir(name).join("repo"))
         .unwrap_or_else(|_| "cell".to_string()).trim().to_string();
     let workspace = format!("/{repo_name}");
 
@@ -560,7 +361,7 @@ pub fn shell(
                 "-o", "UserKnownHostsFile=/dev/null",
                 "-o", "LogLevel=ERROR",
                 "-o", "ConnectTimeout=1",
-                &ssh_target,
+                &target,
                 &probe_cmd,
             ])
             .output();
@@ -580,7 +381,6 @@ pub fn shell(
     // apply synced files from host-side sync dir to VM home
     let sync_dir = format!("/var/lib/cella/cells/{name}/sync");
     if Path::new(&sync_dir).exists() {
-        // scp from host sync dir into VM home
         let scp_result = Command::new("scp")
             .args([
                 "-r",
@@ -588,7 +388,7 @@ pub fn shell(
                 "-o", "UserKnownHostsFile=/dev/null",
                 "-o", "LogLevel=ERROR",
                 &format!("{sync_dir}/."),
-                &format!("{ssh_target}:~/"),
+                &format!("{target}:~/"),
             ])
             .output();
         if let Ok(out) = &scp_result {
@@ -598,96 +398,32 @@ pub fn shell(
         }
     }
 
-    // clear pending autostop — a session is being entered
-    clear_autostop(name);
-
-    let ssh_base = |extra_args: &[&str], cmd: &str| -> Command {
-        let mut c = Command::new("ssh");
-        c.args([
-            "-A",
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "UserKnownHostsFile=/dev/null",
-            "-o", "LogLevel=ERROR",
-            "-o", "ServerAliveInterval=30",
-            "-o", "ServerAliveCountMax=3",
-        ]);
-        for arg in extra_args {
-            c.arg(arg);
+    let (use_pty, cmd) = match command {
+        Some(c) => {
+            let script = format!("cd {} && {}", crate::exec::shell_escape(&workspace), c);
+            (false, format!("sh -c {}", crate::exec::shell_escape(&script)))
         }
-        c.arg(&ssh_target);
-        c.arg(cmd);
-        c
+        None => (true, format!("cd {} && exec $SHELL -l", crate::exec::shell_escape(&workspace))),
     };
 
-    // determine session name and command
-    let sess_name = session.map(|s| s.to_string()).unwrap_or_else(|| {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        format!("s-{ts}")
-    });
-
-    let cmd = match command {
-        Some(c) => format!("cd {workspace} && {c}"),
-        None => {
-            let inner = session_cfg
-                .and_then(|s| s.command.as_deref())
-                .map(|c| format!("{c}"))
-                .unwrap_or_else(|| "exec $SHELL -l".to_string());
-            format!("cd {workspace} && tmux new-session -A -s {sess_name} '{inner}'")
-        }
-    };
-
-    // start hooks after a short delay (session needs to exist first)
-    if command.is_none() {
-        if let Some(cfg) = session_cfg {
-            if !cfg.hooks.is_empty() {
-                upload_hooks(&ssh_target, &workspace, &sess_name, &cfg.hooks)?;
-                // start hooks in background on the VM — the sleep ensures tmux session exists
-                let starter_path = format!("/tmp/cella-start-hooks-{sess_name}.sh");
-                Command::new("ssh")
-                    .args([
-                        "-o", "StrictHostKeyChecking=no",
-                        "-o", "UserKnownHostsFile=/dev/null",
-                        "-o", "LogLevel=ERROR",
-                        &ssh_target,
-                        &format!("sh -c 'nohup sh {starter_path} >/dev/null 2>&1 &'"),
-                    ])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status().ok();
-            }
-        }
+    let mut ssh = Command::new("ssh");
+    if use_pty {
+        ssh.arg("-t");
     }
+    ssh.args([
+        "-A",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "LogLevel=ERROR",
+        "-o", "ServerAliveInterval=30",
+        "-o", "ServerAliveCountMax=3",
+        &target,
+        &cmd,
+    ]);
 
-    let status = ssh_base(&["-t"], &cmd)
+    let status = ssh
         .status()
         .context("ssh failed")?;
-
-    // run on_exit hook
-    if command.is_none() {
-        if let Some(cfg) = session_cfg {
-            if let Some(on_exit) = &cfg.on_exit {
-                let exit_cmd = format!("cd {workspace} && {on_exit}");
-                ssh_base(&[], &exit_cmd)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status().ok();
-            }
-        }
-    }
-
-    // after shell exits: if no sessions remain, hint autostop for sweep
-    if command.is_none() {
-        if let Ok(true) = is_running(name) {
-            let sessions = count_sessions(name).unwrap_or(0);
-            if sessions == 0 {
-                let timeout = read_autostop_timeout(name);
-                mark_autostop(name, timeout);
-            }
-        }
-    }
 
     if !status.success() {
         anyhow::bail!("ssh exited with {}", status);
@@ -695,96 +431,41 @@ pub fn shell(
     Ok(())
 }
 
-fn upload_hooks(
-    ssh_target: &str,
-    workspace: &str,
-    session_name: &str,
-    hooks: &[String],
-) -> Result<()> {
-    // the `session` helper script provides read/send to hooks
-    let session_helper = format!(
-        r#"#!/bin/sh
-case "$1" in
-  read) tmux capture-pane -p -t '{sess}' 2>/dev/null ;;
-  send) shift; tmux send-keys -t '{sess}' "$*" Enter ;;
-  *) echo "usage: session read|send <text>" >&2; exit 1 ;;
-esac"#,
-        sess = session_name
-    );
-
-    // build a starter script that waits for tmux session then launches hooks
-    let mut starter = format!(
-        "#!/bin/sh\n# wait for tmux session to exist\nfor i in $(seq 1 30); do\n  tmux has-session -t '{sess}' 2>/dev/null && break\n  sleep 0.2\ndone\n",
-        sess = session_name
-    );
-    for hook in hooks {
-        let log_path = format!("/tmp/cella-hook-{}.log", hook.replace('/', "-"));
-        starter.push_str(&format!(
-            "cd {workspace} && PATH=\"/tmp:$PATH\" nohup {hook} >'{log}' 2>&1 &\n",
-            workspace = workspace,
-            hook = hook,
-            log = log_path,
-        ));
-    }
-
-    let helper_path = format!("/tmp/cella-session-{}", session_name);
-    let starter_path = format!("/tmp/cella-start-hooks-{}.sh", session_name);
-
-    let ssh_upload = |content: &str, dest: &str| -> Result<()> {
-        let cmd = format!("sh -c 'cat > {dest} && chmod +x {dest}'");
-        let mut child = Command::new("ssh")
-            .args([
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "UserKnownHostsFile=/dev/null",
-                "-o", "LogLevel=ERROR",
-                ssh_target,
-                &cmd,
-            ])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .context("failed to upload hook file")?;
-        if let Some(mut stdin) = child.stdin.take() {
-            use std::io::Write;
-            stdin.write_all(content.as_bytes())?;
-        }
-        child.wait()?;
-        Ok(())
-    };
-
-    ssh_upload(&session_helper, &helper_path)?;
-    ssh_upload(&starter, &starter_path)?;
-
-    // symlink helper as `session` on PATH
-    Command::new("ssh")
-        .args([
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "UserKnownHostsFile=/dev/null",
-            "-o", "LogLevel=ERROR",
-            ssh_target,
-            &format!("ln -sf '{helper_path}' /tmp/session"),
-        ])
-        .output().ok();
-
-    Ok(())
-}
-
-// runtime_dir is now in cell.rs, re-exported above
-
-// List all cells (from cell directories)
-
-// list_cells is now in cell.rs, re-exported above
-
 // Proxy control API
 
 fn register_proxy_rules(ip: &str, branch: &str, config: &CellaConfig) -> Result<()> {
-    let nucleus_domains: Vec<&str> = config.nucleus.allowed_domains.iter().map(|s| s.as_str()).collect();
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "cellIp": ip,
         "branchId": branch,
-        "nucleusAllowedDomains": nucleus_domains,
     });
+
+    // add cell-level egress rules
+    let egress = &config.egress;
+    if egress.writes.is_some() || egress.reads.is_some() || !egress.credentials.is_empty() {
+        let mut egress_json = serde_json::json!({ "additive": true });
+        if let Some(ref writes) = egress.writes {
+            egress_json["writes"] = serde_json::json!({
+                "allowed": writes.allowed,
+                "denied": writes.denied,
+            });
+        }
+        if let Some(ref reads) = egress.reads {
+            egress_json["reads"] = serde_json::json!({
+                "allowed": reads.allowed,
+                "denied": reads.denied,
+            });
+        }
+        if !egress.credentials.is_empty() {
+            egress_json["credentials"] = serde_json::json!(
+                egress.credentials.iter().map(|c| serde_json::json!({
+                    "host": c.host,
+                    "header": c.header,
+                    "envVar": c.env_var,
+                })).collect::<Vec<_>>()
+            );
+        }
+        body["egress"] = egress_json;
+    }
 
     let output = Command::new("curl")
         .args([
@@ -896,6 +577,7 @@ fn deregister_dns(branch: &str, repo: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     // DNS sanitization
 

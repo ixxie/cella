@@ -51,7 +51,7 @@ pub fn run() -> Result<()> {
                     .ok()
                     .and_then(|r| r.root().file_name().map(|n| n.to_string_lossy().to_string()))
                     .unwrap_or_default();
-                let mut ssh_args = vec![user_host.as_str(), "cella", "resolve-cell"];
+                let mut ssh_args = vec![user_host.as_str(), "cella", "util", "resolve-cell"];
                 if !repo_name.is_empty() {
                     ssh_args.push("--repo");
                     ssh_args.push(&repo_name);

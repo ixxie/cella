@@ -32,6 +32,13 @@ in {
       description = "Cell base config directory for localhost (contains flake.nix exporting nixosModule)";
     };
 
+    server = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = "Default server for cella run (overridden by repo config or -s flag)";
+      example = "grove";
+    };
+
     sync = mkOption {
       type = types.listOf types.str;
       default = [];
@@ -61,14 +68,19 @@ in {
         chmod -R a+rX /var/lib/cella/vm-config
       ''}
 
-      ${optionalString (cfg.sync != []) (let
-        syncToml = concatStringsSep ", " (map (s: ''"${s}"'') cfg.sync);
-      in ''
+      ${let
+        hasConfig = cfg.sync != [] || cfg.server != null;
+        syncLine = optionalString (cfg.sync != []) (let
+          syncToml = concatStringsSep ", " (map (s: ''"${s}"'') cfg.sync);
+        in "sync = [${syncToml}]");
+        serverLine = optionalString (cfg.server != null) ''server = "${cfg.server}"'';
+      in optionalString hasConfig ''
         cat > "${registryDir}/config.toml" << 'CLIENTCFG'
-        sync = [${syncToml}]
+        ${serverLine}
+        ${syncLine}
         CLIENTCFG
         chown ${cfg.user}: "${registryDir}/config.toml"
-      '')}
+      ''}
     '';
 
     # Make /etc/hosts writable so `cella tunnel` can add .cell entries at runtime.
@@ -88,7 +100,7 @@ in {
         commands = [
           { command = "${pkgs.iproute2}/bin/ip addr add 127.* dev lo"; options = ["NOPASSWD"]; }
           { command = "${pkgs.iproute2}/bin/ip addr del 127.* dev lo"; options = ["NOPASSWD"]; }
-          { command = "${pkgs.cella}/bin/cella hosts *"; options = ["NOPASSWD"]; }
+          { command = "${pkgs.cella}/bin/cella util hosts *"; options = ["NOPASSWD"]; }
         ];
       }
     ];

@@ -3,10 +3,11 @@
   lib,
   pkgs,
   cellaHost,
+  cellxPkg,
   cell,
   ...
 }: let
-  inherit (cellaHost) bridge proxy user nucleus;
+  inherit (cellaHost) bridge proxy user;
   workspace = "/${cell.repo}";
 in {
   system.stateVersion = "24.11";
@@ -117,27 +118,11 @@ in {
     openssh.authorizedKeys.keys = user.authorizedKeys;
   };
 
-  # Nucleus user — network-restricted review agent
-  users.users.nucleus = lib.mkIf nucleus.enable {
-    isSystemUser = true;
-    group = "users";
-    uid = 999;
-  };
-
-  security.sudo = {
-    enable = nucleus.enable;
-    extraRules = lib.mkIf nucleus.enable [
-      {
-        users = [user.name];
-        commands = [
-          {
-            command = "/run/current-system/sw/bin/su -s /bin/sh nucleus -c *";
-            options = ["NOPASSWD"];
-          }
-        ];
-      }
-    ];
-  };
+  # cellx state directory
+  systemd.tmpfiles.rules = [
+    "d /var/lib/cellx 0755 ${user.name} users -"
+    "d /var/lib/cellx/state 0755 ${user.name} users -"
+  ];
 
   services.getty.autologinUser = user.name;
 
@@ -147,8 +132,8 @@ in {
     systemPackages = with pkgs; [
       git
       curl
-      tmux
       jq
+      cellxPkg
     ];
 
     variables = {
@@ -162,14 +147,6 @@ in {
         directory = *
     '';
 
-    etc."tmux.conf".text = ''
-      set -g status off
-      set -g mouse off
-      set -g default-terminal "tmux-256color"
-      set -ga terminal-overrides ",*:Tc"
-      set -g prefix None
-      bind -n C-] detach-client
-    '';
   };
 
   # Kernel hardening

@@ -153,15 +153,6 @@ with lib; {
       };
     };
 
-    nucleus = {
-      enable = mkEnableOption "nucleus pre-commit review gate";
-      proxyPort = mkOption {
-        type = types.port;
-        default = 8083;
-        description = "Restricted proxy port for nucleus (LLM API only)";
-      };
-    };
-
     user = {
       name = mkOption {
         type = types.str;

@@ -95,14 +95,45 @@ class CellaAddon:
         if ip not in self.cells:
             return False
 
+        cell = self.cells[ip]
         direction = self._classify_method(method)
-        rules = self.egress.get(direction, {})
-        allowed = rules.get("allowed", [])
-        denied = rules.get("denied", [])
 
-        # denied always takes precedence
+        # global rules
+        rules = self.egress.get(direction, {})
+        global_allowed = rules.get("allowed", [])
+        global_denied = rules.get("denied", [])
+
+        # per-cell egress overrides (set by flow engine on op transitions)
+        cell_egress = cell.get("egress") or {}
+        additive = cell_egress.get("additive", True)
+        cell_rules = cell_egress.get(direction) or {}
+        cell_allowed = cell_rules.get("allowed")
+        cell_denied = cell_rules.get("denied")
+
+        # merge: additive means cell rules layer on top of global
+        # non-additive means cell rules replace global
+        if cell_allowed is not None or cell_denied is not None:
+            if additive:
+                allowed = global_allowed
+                denied = global_denied
+                # cell denied adds to global denied
+                if cell_denied:
+                    if isinstance(denied, list):
+                        denied = denied + cell_denied
+                    else:
+                        denied = cell_denied
+                # cell allowed overrides global allowed
+                if cell_allowed is not None:
+                    allowed = cell_allowed
+            else:
+                # standalone: cell rules replace global entirely
+                allowed = cell_allowed or []
+                denied = cell_denied or []
+        else:
+            allowed = global_allowed
+            denied = global_denied
+
         if matches_any(host, denied):
-            # but explicit allowed overrides denied
             if matches_any(host, allowed):
                 return True
             return False
@@ -112,12 +143,43 @@ class CellaAddon:
 
         return False
 
-    def _inject_credentials(self, host: str, flow: http.HTTPFlow):
-        for cred in self.credentials:
+    def _load_secrets_env(self) -> dict[str, str]:
+        secrets_path = Path("/var/lib/cella/secrets.env")
+        if not secrets_path.exists():
+            return {}
+        env = {}
+        for line in secrets_path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip()
+        return env
+
+    def _inject_credentials(self, host: str, client_ip: str, flow: http.HTTPFlow):
+        # global credentials
+        creds = list(self.credentials)
+
+        # per-cell credentials
+        ip = client_ip.removeprefix("::ffff:")
+        if ip in self.cells:
+            cell = self.cells[ip]
+            cell_egress = cell.get("egress") or {}
+            cell_creds = cell_egress.get("credentials", [])
+            creds.extend(cell_creds)
+
+        if not creds:
+            return
+
+        # merge process env with secrets.env (secrets.env takes precedence)
+        secrets = self._load_secrets_env()
+
+        for cred in creds:
             cred_host = cred["host"]
             if host == cred_host or host.endswith(f".{cred_host}"):
                 env_var = cred["envVar"]
-                value = os.environ.get(env_var, "")
+                value = secrets.get(env_var, "") or os.environ.get(env_var, "")
                 if not value:
                     continue
                 header = cred["header"]
@@ -162,7 +224,7 @@ class CellaAddon:
         direction = self._classify_method(method)
         tag = "READ" if direction == "reads" else "WRITE"
         self._log(tag, host, client_ip, f"{method} {path}")
-        self._inject_credentials(host, flow)
+        self._inject_credentials(host, client_ip, flow)
 
 
 addons = [CellaAddon()]

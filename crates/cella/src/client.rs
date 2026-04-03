@@ -23,10 +23,22 @@ pub struct UpResponse {
 }
 
 #[derive(serde::Deserialize)]
+#[allow(dead_code)] // all fields are part of the API contract
+pub struct FlowInfo {
+    pub flow_name: String,
+    pub current_op: String,
+    pub state: String,
+    pub started_at: u64,
+    pub op_started_at: u64,
+}
+
+#[derive(serde::Deserialize)]
 pub struct CellStatus {
     pub name: String,
     pub status: String,
     pub ip: Option<String>,
+    pub repo: Option<String>,
+    pub flow: Option<FlowInfo>,
 }
 
 impl Client {
@@ -156,21 +168,116 @@ impl Client {
         serde_json::from_str(&resp).context(format!("bad response: {resp}"))
     }
 
-    /// SSH hop for interactive shell (bypasses API, needs PTY)
-    pub fn shell(&self, name: &str, session: Option<&str>) -> Result<()> {
+    // Flow management
+
+    pub fn flow_start(&self, name: &str, flow: &str, params: Option<&str>) -> Result<()> {
+        let mut body = serde_json::json!({ "name": name, "flow": flow });
+        if let Some(p) = params {
+            body["params"] = serde_json::Value::String(p.to_string());
+        }
+        let resp = self.request("POST", "/flow/start", Some(&body.to_string()))?;
+        if !resp.contains("\"ok\":true") {
+            anyhow::bail!("flow start failed: {resp}");
+        }
+        Ok(())
+    }
+
+    pub fn flow_stop(&self, name: &str) -> Result<()> {
+        let body = serde_json::json!({ "name": name });
+        let resp = self.request("POST", "/flow/stop", Some(&body.to_string()))?;
+        if !resp.contains("\"ok\":true") {
+            anyhow::bail!("flow stop failed: {resp}");
+        }
+        Ok(())
+    }
+
+    pub fn flow_pause(&self, name: &str) -> Result<()> {
+        let body = serde_json::json!({ "name": name });
+        let resp = self.request("POST", "/flow/pause", Some(&body.to_string()))?;
+        if !resp.contains("\"ok\":true") {
+            anyhow::bail!("flow pause failed: {resp}");
+        }
+        Ok(())
+    }
+
+    pub fn flow_logs(&self, name: &str, lines: u32) -> Result<String> {
+        let body = serde_json::json!({ "name": name, "follow": false, "lines": lines });
+        let resp = self.request("POST", "/flow/logs", Some(&body.to_string()))?;
+        let v: serde_json::Value = serde_json::from_str(&resp)
+            .context("bad flow logs response")?;
+        Ok(v["content"].as_str().unwrap_or("").to_string())
+    }
+
+    pub fn flow_logs_follow(&self, name: &str) -> Result<()> {
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", self.local_port))
+            .context("failed to connect to control API")?;
+
+        let body = serde_json::json!({ "name": name, "follow": true });
+        let body_str = body.to_string();
+        let req = format!(
+            "POST /flow/logs HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body_str}",
+            body_str.len(),
+        );
+        stream.write_all(req.as_bytes())?;
+
+        // skip HTTP headers
+        let mut header_buf = Vec::new();
+        let mut b = [0u8; 1];
+        loop {
+            if stream.read(&mut b)? == 0 { return Ok(()); }
+            header_buf.push(b[0]);
+            if header_buf.ends_with(b"\r\n\r\n") { break; }
+        }
+
+        // parse chunked transfer encoding
+        use std::io::{BufRead, BufReader, Write};
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        let mut reader = BufReader::new(stream);
+
+        loop {
+            // read chunk size line
+            let mut size_line = String::new();
+            if reader.read_line(&mut size_line).unwrap_or(0) == 0 {
+                break;
+            }
+            let size = usize::from_str_radix(size_line.trim(), 16).unwrap_or(0);
+            if size == 0 {
+                break;
+            }
+
+            // read chunk data
+            let mut chunk = vec![0u8; size];
+            if reader.read_exact(&mut chunk).is_err() {
+                break;
+            }
+            out.write_all(&chunk).ok();
+            out.flush().ok();
+
+            // consume trailing \r\n
+            let mut crlf = [0u8; 2];
+            reader.read_exact(&mut crlf).ok();
+        }
+        Ok(())
+    }
+
+    /// SSH hop for shell or command execution
+    pub fn shell(&self, name: &str, command: Option<&str>) -> Result<()> {
+        let remote_cmd = match command {
+            Some(cmd) => crate::exec::cella_hop(name, cmd),
+            None => format!("cella shell --server {}", name),
+        };
         let mut args = vec![
             "-t".to_string(),
+        ];
+        args.extend([
             "-A".to_string(),
             "-o".to_string(), "ServerAliveInterval=30".to_string(),
             "-o".to_string(), "ServerAliveCountMax=3".to_string(),
             "-S".to_string(), self.control_socket.clone(),
             self.user_host.clone(),
-            "cella".to_string(), "shell".to_string(), "--server".to_string(), name.to_string(),
-        ];
-        if let Some(s) = session {
-            args.push("-s".to_string());
-            args.push(s.to_string());
-        }
+            remote_cmd,
+        ]);
         let status = Command::new("ssh")
             .args(&args)
             .status()
@@ -185,7 +292,6 @@ impl Client {
     #[instrument(skip(self, paths))]
     pub fn sync_files(&self, name: &str, paths: &[String]) -> Result<()> {
         let home = std::env::var("HOME").unwrap_or_default();
-        let sync_dir = format!("/var/lib/cella/cells/{name}/sync");
 
         for path in paths {
             let expanded = if path.starts_with("~/") {
@@ -257,33 +363,5 @@ impl Client {
             warn!(error = %e, "failed to fix sync file ownership");
         }
         Ok(())
-    }
-
-    /// Run a command on the server and capture output with timeout
-    pub fn exec(&self, cmd: &str, timeout_secs: u64) -> Result<String> {
-        let mut child = Command::new("ssh")
-            .args([
-                "-o", "ConnectTimeout=5",
-                "-S", &self.control_socket,
-                &self.user_host,
-                cmd,
-            ])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .context("ssh exec failed")?;
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-        loop {
-            if let Some(_status) = child.try_wait()? {
-                let output = child.wait_with_output()?;
-                return Ok(String::from_utf8_lossy(&output.stdout).to_string());
-            }
-            if std::time::Instant::now() > deadline {
-                child.kill().ok(); // best-effort, process may already be dead
-                anyhow::bail!("exec timed out");
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
     }
 }

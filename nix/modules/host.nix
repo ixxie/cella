@@ -18,9 +18,6 @@ with lib; let
     user = {
       inherit (cfg.user) name uid authorizedKeys;
     };
-    nucleus = {
-      inherit (cfg.nucleus) enable proxyPort;
-    };
     vm = {
       inherit (cfg.vm) vcpu mem varSize;
     };
@@ -47,7 +44,6 @@ with lib; let
     controlPort = cfg.proxy.controlPort;
     logFile = cfg.proxy.logFile;
     bindAddress = cfg.bridge.address;
-    nucleusEnabled = cfg.nucleus.enable;
   };
 in {
   imports = [
@@ -108,10 +104,8 @@ in {
             iifname "${cfg.bridge.name}" ip daddr ${cfg.bridge.address} tcp dport ${toString cfg.proxy.httpPort} accept
             # cells -> proxy git-credential
             iifname "${cfg.bridge.name}" ip daddr ${cfg.bridge.address} tcp dport ${toString cfg.proxy.gitCredentialPort} accept
-            ${lib.optionalString cfg.nucleus.enable ''
-            # cells -> nucleus proxy
-            iifname "${cfg.bridge.name}" ip daddr ${cfg.bridge.address} tcp dport ${toString cfg.nucleus.proxyPort} accept
-          ''}
+            # cells -> control API (for flow rule updates)
+            iifname "${cfg.bridge.name}" ip daddr ${cfg.bridge.address} tcp dport ${toString cfg.proxy.controlPort} accept
             # cells -> host SSH
             iifname "${cfg.bridge.name}" ip daddr ${cfg.bridge.address} tcp dport 22 accept
 
@@ -129,7 +123,7 @@ in {
 
           chain input {
             type filter hook input priority 0; policy accept;
-            iifname "${cfg.bridge.name}" ip daddr ${cfg.bridge.address} tcp dport { ${toString cfg.proxy.httpPort}, ${toString cfg.proxy.gitCredentialPort}${lib.optionalString cfg.nucleus.enable ", ${toString cfg.nucleus.proxyPort}"} } accept
+            iifname "${cfg.bridge.name}" ip daddr ${cfg.bridge.address} tcp dport { ${toString cfg.proxy.httpPort}, ${toString cfg.proxy.gitCredentialPort}, ${toString cfg.proxy.controlPort} } accept
           }
         '';
       };
@@ -151,7 +145,7 @@ in {
       };
     };
 
-    # Generate a host SSH key for server-side operations (sweep, session counting).
+    # Generate a host SSH key for server-side VM access.
     # The public key is included in the host config so VMs authorize it.
     systemd.services.cella-hostkey = {
       description = "Generate cella host SSH key";
@@ -245,22 +239,6 @@ in {
       '';
     };
 
-    # Nucleus MITM proxy (per-cell restricted allowlist)
-    systemd.services.cella-nucleus-proxy = mkIf cfg.nucleus.enable {
-      description = "Cella Nucleus MITM Proxy";
-      wantedBy = ["multi-user.target"];
-      after = ["network.target"];
-      serviceConfig = {
-        ExecStart = "${pkgs.mitmproxy}/bin/mitmdump --listen-host ${cfg.bridge.address} --listen-port ${toString cfg.nucleus.proxyPort} --set confdir=/var/lib/cella/ca -s ${./proxy/nucleus_addon.py}";
-        Restart = "always";
-        RestartSec = 5;
-        EnvironmentFile =
-          (lib.optional (cfg.credentialsFile != null) cfg.credentialsFile)
-          ++ ["-/var/lib/cella/secrets.env"];
-        ReadWritePaths = ["/var/log/cella" "/var/lib/cella/ca" "/var/lib/cella"];
-      };
-    };
-
     # Cella services (git credentials + control API)
     systemd.services.cella-services = {
       description = "Cella Git Credentials + Control API";
@@ -268,31 +246,12 @@ in {
       after = ["network.target"];
       path = [pkgs.git pkgs.sudo pkgs.util-linux pkgs.systemd pkgs.openssh pkgs.curl pkgs.nix];
       serviceConfig = {
-        ExecStart = "${pkgs.cella}/bin/cella proxy --config /etc/cella/proxy-config.json";
+        ExecStart = "${pkgs.cella}/bin/cella server proxy --config /etc/cella/proxy-config.json";
         Restart = "always";
         RestartSec = 5;
         EnvironmentFile =
           (lib.optional (cfg.credentialsFile != null) cfg.credentialsFile)
           ++ ["-/var/lib/cella/secrets.env"];
-      };
-    };
-
-    # Sweep timer — auto-stop idle cells
-    systemd.services.cella-sweep = {
-      description = "Cella cell auto-stop sweep";
-      serviceConfig = {
-        Type = "oneshot";
-        ExecStart = "${pkgs.cella}/bin/cella sweep";
-      };
-      path = [pkgs.openssh];
-    };
-
-    systemd.timers.cella-sweep = {
-      description = "Cella cell auto-stop sweep timer";
-      wantedBy = ["timers.target"];
-      timerConfig = {
-        OnBootSec = "60s";
-        OnUnitActiveSec = "60s";
       };
     };
 

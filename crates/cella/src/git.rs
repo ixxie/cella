@@ -122,7 +122,7 @@ impl Repo {
         data_dir(&self.root).join(name)
     }
 
-    pub fn init_clone(&self, name: &str, config: &CellaConfig) -> Result<PathBuf> {
+    pub fn init_clone(&self, name: &str, _config: &CellaConfig) -> Result<PathBuf> {
         let clone = self.clone_path(name);
         if clone.exists() {
             return Ok(clone);
@@ -167,7 +167,6 @@ impl Repo {
             }
         }
 
-        install_nucleus_hook(&clone, config)?;
         Ok(clone)
     }
 
@@ -226,42 +225,13 @@ impl Repo {
     }
 }
 
-fn install_nucleus_hook(clone: &Path, config: &CellaConfig) -> Result<()> {
-    let cmd = match &config.nucleus.command {
-        Some(c) => c,
-        None => return Ok(()),
-    };
-
-    let hooks_dir = clone.join(".git/hooks");
-    std::fs::create_dir_all(&hooks_dir)?;
-    let hook_path = hooks_dir.join("pre-commit");
-    let hook = format!(
-        r#"#!/bin/sh
-diff=$(git diff --cached)
-if [ -z "$diff" ]; then exit 0; fi
-echo "$diff" | sudo su -s /bin/sh nucleus -c '
-  export HTTP_PROXY="http://${{CELLA_BRIDGE:-192.168.83.1}}:{nucleus_port}"
-  export HTTPS_PROXY="$HTTP_PROXY"
-  export http_proxy="$HTTP_PROXY"
-  export https_proxy="$HTTP_PROXY"
-  {cmd}
-'
-"#,
-        nucleus_port = config.nucleus.proxy_port.unwrap_or(8083),
-        cmd = cmd,
-    );
-    std::fs::write(&hook_path, hook)?;
-    std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755))?;
-    Ok(())
-}
-
 // Server-side clone management — clones live inside cell dirs
 
 pub fn server_clone_path(name: &str) -> PathBuf {
     crate::vm::cell_repo_dir(name)
 }
 
-pub fn init_clone_server(name: &str, config: &CellaConfig) -> Result<PathBuf> {
+pub fn init_clone_server(name: &str, _config: &CellaConfig) -> Result<PathBuf> {
     let clone = server_clone_path(name);
     if clone.join(".git").exists() {
         return Ok(clone);
@@ -291,7 +261,6 @@ pub fn init_clone_server(name: &str, config: &CellaConfig) -> Result<PathBuf> {
         }
     }
 
-    install_nucleus_hook(&clone, config)?;
     install_chown_hook(&clone)?;
 
     // set ownership to cell user (uid 1000)

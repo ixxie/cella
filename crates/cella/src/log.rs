@@ -25,10 +25,6 @@ fn is_writable(path: &PathBuf) -> bool {
     }
 }
 
-pub fn log_file_path() -> PathBuf {
-    log_dir().join("cella.log")
-}
-
 pub fn init() {
     let dir = log_dir();
     let file_appender = tracing_appender::rolling::never(&dir, "cella.log");

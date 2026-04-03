@@ -16,7 +16,6 @@
   bridge = hostConfig.bridge or { address = "192.168.83.1"; name = "cellabr"; subnet = "192.168.83.0/24"; };
   proxy = hostConfig.proxy or { httpPort = 8080; gitCredentialPort = 8081; controlPort = 8082; logFile = "/var/log/cella/proxy.log"; };
   user = hostConfig.user or { name = "agent"; uid = 1000; authorizedKeys = []; };
-  nucleus = hostConfig.nucleus or { enable = false; proxyPort = 8083; };
   vm = hostConfig.vm or { vcpu = 4; mem = 4096; varSize = 4096; };
 
   cell = { inherit ip name cellDir repo; };
@@ -25,7 +24,8 @@ in {
     inherit system;
     specialArgs = {
       inherit cell;
-      cellaHost = { inherit bridge proxy user nucleus vm; };
+      cellxPkg = cella.packages.${system}.cellx;
+      cellaHost = { inherit bridge proxy user vm; };
     };
     modules = [
       microvm.nixosModules.microvm

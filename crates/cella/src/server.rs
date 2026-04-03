@@ -1,12 +1,9 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 const REGISTRY_FILE: &str = ".config/cella/servers.toml";
 const CLIENT_CONFIG: &str = ".config/cella/config.toml";
-const ACTIVE_DIR: &str = ".config/cella/active";
 
 // Client config
 
@@ -14,6 +11,8 @@ const ACTIVE_DIR: &str = ".config/cella/active";
 pub struct ClientConfig {
     #[serde(default)]
     pub sync: Vec<String>,
+    #[serde(default)]
+    pub server: Option<String>,
 }
 
 pub fn load_client_config() -> ClientConfig {
@@ -50,12 +49,6 @@ impl ActiveServer {
         matches!(self, ActiveServer::Remote { .. })
     }
 
-    pub fn remote_url(&self) -> Result<String> {
-        match self.target()? {
-            Some(t) => Ok(format!("cella://{t}")),
-            None => Ok("cella://localhost".to_string()),
-        }
-    }
 }
 
 // Server registry
@@ -118,56 +111,6 @@ pub fn list() -> Result<Vec<(String, String)>> {
     Ok(entries)
 }
 
-// Active server tracking (per-repo)
-
-fn repo_hash(repo_root: &Path) -> String {
-    let mut hasher = DefaultHasher::new();
-    repo_root.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
-
-fn active_file(repo_root: &Path) -> PathBuf {
-    home_dir().join(ACTIVE_DIR).join(repo_hash(repo_root))
-}
-
-pub fn active(repo_root: &Path) -> Result<ActiveServer> {
-    let path = active_file(repo_root);
-    if !path.exists() {
-        return Ok(ActiveServer::Localhost);
-    }
-
-    let content = std::fs::read_to_string(&path)
-        .context("reading active server")?
-        .trim()
-        .to_string();
-
-    if content.is_empty() || content == "localhost" {
-        return Ok(ActiveServer::Localhost);
-    }
-
-    // support old format (system:name, repo:name) and new format (just name)
-    let name = content
-        .strip_prefix("system:")
-        .or_else(|| content.strip_prefix("repo:"))
-        .unwrap_or(&content);
-
-    Ok(ActiveServer::Remote { name: name.to_string() })
-}
-
-pub fn write_active(repo_root: &Path, server: &ActiveServer) -> Result<()> {
-    let path = active_file(repo_root);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let content = match server {
-        ActiveServer::Localhost => "localhost",
-        ActiveServer::Remote { name } => name,
-    };
-
-    std::fs::write(&path, format!("{content}\n"))?;
-    Ok(())
-}
 
 pub fn resolve(name: &str) -> Result<ActiveServer> {
     if name == "localhost" {

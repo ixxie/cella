@@ -8,38 +8,21 @@ pub struct CellaConfig {
     pub memory: String,
     #[serde(default = "default_vcpu")]
     pub vcpu: u32,
-    #[serde(default = "default_timeout")]
-    pub shell_timeout: u64,
     #[serde(default)]
     pub ports: Vec<u16>,
     #[serde(default)]
-    pub post_push: Option<String>,
+    pub server: Option<String>,
     #[serde(default)]
-    pub session: SessionConfig,
+    pub post_push: Option<String>,
     #[serde(default)]
     pub proxy: Vec<ProxyRule>,
     #[serde(default)]
-    pub nucleus: NucleusConfig,
-    #[serde(default)]
     pub secrets: SecretsConfig,
+    #[serde(default)]
+    pub egress: CellEgressConfig,
     // legacy — use post_push instead
     #[serde(default)]
     pub hooks: HooksConfig,
-}
-
-impl CellaConfig {
-    pub fn post_push(&self) -> Option<&str> {
-        self.post_push.as_deref()
-            .or(self.hooks.post_push.as_deref())
-    }
-}
-
-#[derive(Debug, Default, Deserialize, Serialize, Clone)]
-pub struct SessionConfig {
-    pub command: Option<String>,
-    pub on_exit: Option<String>,
-    #[serde(default)]
-    pub hooks: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
@@ -50,14 +33,30 @@ pub struct HooksConfig {
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct SecretsConfig {
     pub command: Option<String>,
+    pub recipient: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
-pub struct NucleusConfig {
-    pub command: Option<String>,
-    pub proxy_port: Option<u16>,
-    #[serde(default, rename = "allowedDomains")]
-    pub allowed_domains: Vec<String>,
+pub struct CellEgressConfig {
+    #[serde(default)]
+    pub writes: Option<CellEgressRules>,
+    #[serde(default)]
+    pub reads: Option<CellEgressRules>,
+    #[serde(default)]
+    pub credentials: Vec<CredentialConfig>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+pub struct CellEgressRules {
+    pub allowed: Option<Vec<String>>,
+    pub denied: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct CredentialConfig {
+    pub host: String,
+    pub header: String,
+    pub env_var: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -78,20 +77,18 @@ pub enum ProxyMode {
 
 fn default_memory() -> String { "2G".to_string() }
 fn default_vcpu() -> u32 { 2 }
-fn default_timeout() -> u64 { 300 }
 
 impl Default for CellaConfig {
     fn default() -> Self {
         Self {
             memory: default_memory(),
             vcpu: default_vcpu(),
-            shell_timeout: default_timeout(),
             ports: Vec::new(),
+            server: None,
             post_push: None,
-            session: SessionConfig::default(),
             proxy: Vec::new(),
-            nucleus: NucleusConfig::default(),
             secrets: SecretsConfig::default(),
+            egress: CellEgressConfig::default(),
             hooks: HooksConfig::default(),
         }
     }

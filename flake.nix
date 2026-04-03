@@ -38,6 +38,8 @@
           inherit filter;
         };
         commonArgs = {
+          pname = "cella";
+          version = "0.1.0";
           src = cellaSource;
           buildInputs = [pkgs.openssl];
           nativeBuildInputs = [pkgs.pkg-config];
@@ -45,14 +47,23 @@
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
         cella = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
+          cargoExtraArgs = "-p cella";
+          nativeBuildInputs = (commonArgs.nativeBuildInputs or []) ++ [pkgs.makeWrapper];
           postInstall = ''
+            wrapProgram $out/bin/cella \
+              --prefix PATH : ${pkgs.lib.makeBinPath [pkgs.age pkgs.openssh]}
             ln -s $out/bin/cella $out/bin/git-remote-cella
           '';
+        });
+        cellx = craneLib.buildPackage (commonArgs // {
+          inherit cargoArtifacts;
+          cargoExtraArgs = "-p cellx";
         });
       in {
         formatter = pkgs.alejandra;
 
         packages.default = cella;
+        packages.cellx = cellx;
 
         devShells.default = pkgs.mkShell {
           buildInputs = [

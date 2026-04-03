@@ -1,5 +1,6 @@
 mod cell;
 mod cli;
+mod exec;
 mod client;
 mod config;
 mod deploy;

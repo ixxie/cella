@@ -25,7 +25,11 @@ fn spinner(msg: &str) -> indicatif::ProgressBar {
 pub trait Transport {
     fn is_running(&self, cell: &str) -> Result<bool>;
     fn ensure_running(&self, cell: &str, repo: &git::Repo, cfg: &config::CellaConfig) -> Result<()>;
-    fn shell(&self, cell: &str, session: Option<&str>, command: Option<&str>, cfg: &config::SessionConfig) -> Result<()>;
+    fn shell(&self, cell: &str, command: Option<&str>) -> Result<()>;
+    fn flow_start(&self, cell: &str, flow_name: &str, params: Option<&str>) -> Result<()>;
+    fn flow_stop(&self, cell: &str) -> Result<()>;
+    fn flow_pause(&self, cell: &str) -> Result<()>;
+    fn flow_logs(&self, cell: &str, follow: bool) -> Result<()>;
 }
 
 // Local transport — calls vm.rs directly
@@ -59,12 +63,37 @@ impl Transport for LocalTransport {
         vm::start(cell, repo_name, cfg)?;
         sp.finish_with_message(format!("{} booted {}", up_icon(), bold(cell)));
 
-        vm::write_autostop_timeout(cell, cfg.shell_timeout);
         Ok(())
     }
 
-    fn shell(&self, cell: &str, session: Option<&str>, command: Option<&str>, cfg: &config::SessionConfig) -> Result<()> {
-        vm::shell(cell, session, command, Some(cfg))
+    fn shell(&self, cell: &str, command: Option<&str>) -> Result<()> {
+        vm::shell(cell, command)
+    }
+
+    fn flow_start(&self, cell: &str, flow_name: &str, params: Option<&str>) -> Result<()> {
+        let inner = match params {
+            Some(p) => format!("cellx flow run {flow_name} --params {}", crate::exec::shell_escape(p)),
+            None => format!("cellx flow run {flow_name}"),
+        };
+        let cmd = crate::exec::detached(&inner, "/tmp/cellx/flow.log");
+        vm::shell(cell, Some(&cmd))
+    }
+
+    fn flow_stop(&self, cell: &str) -> Result<()> {
+        vm::shell(cell, Some("cellx flow done"))
+    }
+
+    fn flow_pause(&self, cell: &str) -> Result<()> {
+        vm::shell(cell, Some("cellx flow pause"))
+    }
+
+    fn flow_logs(&self, cell: &str, follow: bool) -> Result<()> {
+        let cmd = if follow {
+            "tail -f /tmp/cellx/flow.log 2>/dev/null & TAIL=$!; while kill -0 $TAIL 2>/dev/null; do if [ ! -f /tmp/cellx/flow.json ]; then kill $TAIL 2>/dev/null; break; fi; sleep 1; done; wait $TAIL 2>/dev/null".to_string()
+        } else {
+            "tail -100 /tmp/cellx/flow.log 2>/dev/null || echo 'no flow log yet'".to_string()
+        };
+        vm::shell(cell, Some(&cmd))
     }
 }
 
@@ -135,7 +164,29 @@ impl Transport for RemoteTransport {
         Ok(())
     }
 
-    fn shell(&self, cell: &str, session: Option<&str>, _command: Option<&str>, _cfg: &config::SessionConfig) -> Result<()> {
-        self.client.shell(cell, session)
+    fn shell(&self, cell: &str, command: Option<&str>) -> Result<()> {
+        self.client.shell(cell, command)
+    }
+
+    fn flow_start(&self, cell: &str, flow_name: &str, params: Option<&str>) -> Result<()> {
+        self.client.flow_start(cell, flow_name, params)
+    }
+
+    fn flow_stop(&self, cell: &str) -> Result<()> {
+        self.client.flow_stop(cell)
+    }
+
+    fn flow_pause(&self, cell: &str) -> Result<()> {
+        self.client.flow_pause(cell)
+    }
+
+    fn flow_logs(&self, cell: &str, follow: bool) -> Result<()> {
+        if follow {
+            self.client.flow_logs_follow(cell)
+        } else {
+            let content = self.client.flow_logs(cell, 100)?;
+            print!("{content}");
+            Ok(())
+        }
     }
 }

@@ -42,17 +42,19 @@ main() {
 
   if [ -w "$INSTALL_DIR" ]; then
     mv "${tmp}/cella" "${INSTALL_DIR}/cella"
+    mv "${tmp}/cellx" "${INSTALL_DIR}/cellx"
   else
     echo "installing to ${INSTALL_DIR} (requires sudo)..."
     sudo mv "${tmp}/cella" "${INSTALL_DIR}/cella"
+    sudo mv "${tmp}/cellx" "${INSTALL_DIR}/cellx"
   fi
 
-  chmod +x "${INSTALL_DIR}/cella"
+  chmod +x "${INSTALL_DIR}/cella" "${INSTALL_DIR}/cellx"
 
   # symlink git remote helper
   ln -sf "${INSTALL_DIR}/cella" "${INSTALL_DIR}/git-remote-cella"
 
-  echo "installed cella to ${INSTALL_DIR}/cella"
+  echo "installed cella + cellx to ${INSTALL_DIR}/"
 }
 
 main
