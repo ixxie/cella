@@ -42,11 +42,15 @@ impl Session {
         .context("SSH connection timed out")?
         .context("SSH connection failed")?;
 
-        let home = std::env::var("HOME").unwrap_or_default();
-        for path in [
+        let home = std::env::var("HOME")
+            .unwrap_or_else(|_| "/root".to_string());
+        let mut key_paths = vec![
             format!("{home}/.ssh/id_ed25519"),
             format!("{home}/.ssh/id_rsa"),
-        ] {
+        ];
+        // server-side key (systemd services may not have HOME set)
+        key_paths.push("/var/lib/cella/ssh/id_ed25519".to_string());
+        for path in key_paths {
             if let Ok(key) = keys::load_secret_key(&path, None) {
                 let key = keys::key::PrivateKeyWithHashAlg::new(Arc::new(key), None);
                 let result = handle.authenticate_publickey(&user, key).await;
