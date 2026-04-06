@@ -178,9 +178,21 @@ enum ServerAction {
     List,
     /// Deploy server config from current directory
     Deploy,
+    /// Garbage collect stopped cells older than a threshold
+    Gc(GcArgs),
     #[command(hide = true)]
     /// Run the network proxy (used by systemd)
     Proxy(ProxyArgs),
+}
+
+#[derive(Args, Debug)]
+struct GcArgs {
+    /// Delete cells stopped longer than this (e.g. "7d", "24h", "1h")
+    #[arg(long, default_value = "7d")]
+    older_than: String,
+    /// Dry run — show what would be deleted without deleting
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Args)]
@@ -293,6 +305,7 @@ pub fn run() -> Result<()> {
             ServerAction::Remove { name } => cmd_server_remove(&name),
             ServerAction::List => cmd_server_list(),
             ServerAction::Deploy => cmd_deploy(),
+            ServerAction::Gc(args) => cmd_gc(args),
         },
         Commands::Util(args) => match args.action {
             UtilAction::ResolveCell { repo } => cmd_resolve_cell(repo.as_deref()),
@@ -529,6 +542,75 @@ fn cmd_server_list() -> Result<()> {
 
 fn cmd_deploy() -> Result<()> {
     deploy::run()
+}
+
+fn cmd_gc(args: GcArgs) -> Result<()> {
+    let threshold_secs = flow::parse_duration(&args.older_than)
+        .ok_or_else(|| anyhow::anyhow!("invalid duration '{}' — use e.g. 7d, 24h, 1h", args.older_than))?;
+    let now = flow::now_secs();
+
+    let cells = vm::list_cells().unwrap_or_default();
+    let mut deleted = 0;
+
+    for name in &cells {
+        if vm::is_running(name).unwrap_or(false) {
+            continue;
+        }
+
+        // check flow-status.json for last activity timestamp
+        let status_path = crate::cell::cell_dir(name).join("flow-status.json");
+        let last_active = std::fs::read_to_string(&status_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v["op_started_at"].as_u64())
+            .unwrap_or(0);
+
+        // fallback: check cell dir mtime
+        let last_active = if last_active > 0 {
+            last_active
+        } else {
+            std::fs::metadata(crate::cell::cell_dir(name))
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        };
+
+        if last_active == 0 {
+            continue;
+        }
+
+        let age = now.saturating_sub(last_active);
+        if age < threshold_secs {
+            continue;
+        }
+
+        let age_str = if age >= 86400 {
+            format!("{}d", age / 86400)
+        } else if age >= 3600 {
+            format!("{}h", age / 3600)
+        } else {
+            format!("{}m", age / 60)
+        };
+
+        if args.dry_run {
+            println!("  {} would delete {} (stopped {})", dim("~"), bold(name), dim(&age_str));
+        } else {
+            vm::delete(name)?;
+            println!("  {} deleted {} (stopped {})", rm(), bold(name), dim(&age_str));
+            deleted += 1;
+        }
+    }
+
+    if args.dry_run {
+        println!("{} dry run — no cells deleted", dim("ℹ"));
+    } else if deleted == 0 {
+        println!("  {}", dim("no stale cells to clean up"));
+    } else {
+        println!("{} cleaned up {} cell{}", ok(), deleted, if deleted == 1 { "" } else { "s" });
+    }
+    Ok(())
 }
 
 // Cell commands
