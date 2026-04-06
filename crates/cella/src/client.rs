@@ -47,7 +47,9 @@ impl Client {
 
     #[instrument]
     pub fn connect(user_host: &str) -> Result<Self> {
-        let rt = tokio::runtime::Runtime::new()
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
             .context("failed to create tokio runtime")?;
 
         let session = rt.block_on(async {

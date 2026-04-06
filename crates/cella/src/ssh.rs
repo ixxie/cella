@@ -42,7 +42,6 @@ impl Session {
         .context("SSH connection timed out")?
         .context("SSH connection failed")?;
 
-        // Try key files
         let home = std::env::var("HOME").unwrap_or_default();
         for path in [
             format!("{home}/.ssh/id_ed25519"),
@@ -117,12 +116,20 @@ impl Session {
         channel.eof().await?;
 
         let mut response = Vec::new();
-        while let Some(msg) = channel.wait().await {
-            match msg {
-                ChannelMsg::Data { ref data } => {
-                    response.extend_from_slice(data);
+        loop {
+            tokio::select! {
+                msg = channel.wait() => {
+                    match msg {
+                        Some(ChannelMsg::Data { ref data }) => {
+                            response.extend_from_slice(data);
+                        }
+                        Some(ChannelMsg::Eof) | None => break,
+                        _ => {}
+                    }
                 }
-                _ => {}
+                _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
+                    anyhow::bail!("control API request timed out");
+                }
             }
         }
         let response = String::from_utf8_lossy(&response).to_string();
