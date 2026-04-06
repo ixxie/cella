@@ -38,6 +38,11 @@ enum Commands {
         /// Branch name
         name: String,
     },
+    /// Print shell hook for cella cd (add to shell config)
+    Hook {
+        /// Shell: fish, bash, zsh, nu, powershell
+        shell: String,
+    },
     /// Start or resume a flow
     Run(RunArgs),
     /// Pause the running flow (cell stays up)
@@ -334,6 +339,7 @@ pub fn run() -> Result<()> {
             let repo = git::Repo::open()?;
             cmd_path(&repo, &name)
         }
+        Commands::Hook { shell } => cmd_hook(&shell),
         Commands::Status { name } => {
             let repo = git::Repo::open()?;
             cmd_status(&repo, name.as_deref())
@@ -512,6 +518,42 @@ fn cmd_path(repo: &git::Repo, name: &str) -> Result<()> {
         anyhow::bail!("no worktree for '{name}' — use 'cella add {name}' first");
     }
     println!("{}", path.display());
+    Ok(())
+}
+
+fn cmd_hook(shell: &str) -> Result<()> {
+    let hook = match shell {
+        "fish" => r#"function cella
+    if test "$argv[1]" = "cd"
+        cd (command cella path $argv[2])
+    else
+        command cella $argv
+    end
+end"#,
+        "bash" | "zsh" => r#"cella() {
+    if [ "$1" = "cd" ]; then
+        cd "$(command cella path "$2")"
+    else
+        command cella "$@"
+    fi
+}"#,
+        "nu" | "nushell" => r#"def --wrapped cella [...args: string] {
+    if ($args | first) == "cd" {
+        cd (^cella path ($args | get 1))
+    } else {
+        ^cella ...$args
+    }
+}"#,
+        "powershell" | "pwsh" => r#"function cella {
+    if ($args[0] -eq "cd") {
+        Set-Location (& cella.exe path $args[1])
+    } else {
+        & cella.exe @args
+    }
+}"#,
+        _ => anyhow::bail!("unsupported shell '{shell}' — use fish, bash, zsh, nu, or powershell"),
+    };
+    println!("{hook}");
     Ok(())
 }
 
