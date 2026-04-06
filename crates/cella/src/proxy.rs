@@ -378,7 +378,11 @@ async fn handle_list() -> (&'static str, String) {
 /// Connect to a cell VM via russh
 async fn cell_session(name: &str) -> anyhow::Result<crate::ssh::Session> {
     let (_, target) = crate::vm::ssh_target(name)?;
-    crate::ssh::Session::connect(&target).await
+    eprintln!("cell_session: connecting to {target}");
+    match crate::ssh::Session::connect(&target).await {
+        Ok(s) => { eprintln!("cell_session: connected"); Ok(s) }
+        Err(e) => { eprintln!("cell_session: failed: {e:?}"); Err(e) }
+    }
 }
 
 async fn handle_flow_start(req: &str) -> (&'static str, String) {
