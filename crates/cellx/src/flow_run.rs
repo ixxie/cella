@@ -8,7 +8,7 @@ use tracing::info;
 use flow::{
     Decision, FlowConfig, FlowReport, FlowState, FlowStatus, Lifecycle, NetRule,
     Op, Rule, Signal, check_signal, flow_state_dir, load_flow, load_op, now_secs,
-    op_allows, op_workspace, read_result_from,
+    op_allows, op_workspace, read_result_from, resolve_timeout,
 };
 
 const BRIDGE_ADDR: &str = "192.168.83.1";
@@ -578,6 +578,16 @@ fn run_loop(
 
         if let Err(e) = onion_result {
             return FlowOutcome::Failure(format!("hook execution: {e}"));
+        }
+
+        // check op timeout
+        if let Some(timeout) = resolve_timeout(&op.config, &flow_config.flow) {
+            if duration > timeout {
+                info!(op = %current_op, duration, timeout, "op timed out");
+                return FlowOutcome::Failure(
+                    format!("op '{}' timed out ({}s > {}s)", current_op, duration, timeout)
+                );
+            }
         }
 
         info!(op = %current_op, duration, "op finished");
