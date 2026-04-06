@@ -12,6 +12,7 @@ mod proxy;
 mod remote;
 mod transport;
 mod vm;
+mod worktree;
 
 use anyhow::Result;
 
