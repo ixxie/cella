@@ -39,6 +39,10 @@ impl Repo {
         })
     }
 
+    pub fn from_root(root: PathBuf) -> Self {
+        Self { root }
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -87,6 +91,55 @@ impl Repo {
             anyhow::bail!("failed to delete branch '{name}'");
         }
         Ok(())
+    }
+
+    // Worktree management
+
+    pub fn worktree_add(&self, path: &Path, branch: &str) -> Result<()> {
+        let status = Command::new("git")
+            .args(["worktree", "add", path.to_str().unwrap(), branch])
+            .current_dir(&self.root)
+            .status()
+            .context("adding worktree")?;
+        if !status.success() {
+            anyhow::bail!("failed to add worktree for branch '{branch}'");
+        }
+        Ok(())
+    }
+
+    pub fn worktree_remove(&self, path: &Path) -> Result<()> {
+        let status = Command::new("git")
+            .args(["worktree", "remove", "--force", path.to_str().unwrap()])
+            .current_dir(&self.root)
+            .status()
+            .context("removing worktree")?;
+        if !status.success() {
+            anyhow::bail!("failed to remove worktree at '{}'", path.display());
+        }
+        Ok(())
+    }
+
+    pub fn worktree_list(&self) -> Result<Vec<(String, PathBuf)>> {
+        let output = Command::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(&self.root)
+            .output()
+            .context("listing worktrees")?;
+        let text = String::from_utf8(output.stdout)?;
+        let mut result = Vec::new();
+        let mut current_path: Option<PathBuf> = None;
+        for line in text.lines() {
+            if let Some(p) = line.strip_prefix("worktree ") {
+                current_path = Some(PathBuf::from(p));
+            } else if let Some(b) = line.strip_prefix("branch refs/heads/") {
+                if let Some(path) = current_path.take() {
+                    result.push((b.to_string(), path));
+                }
+            } else if line.is_empty() {
+                current_path = None;
+            }
+        }
+        Ok(result)
     }
 
     // Remote management
@@ -282,6 +335,24 @@ fn install_chown_hook(clone: &Path) -> Result<()> {
     );
     std::fs::write(&hook_path, hook)?;
     std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755))?;
+    Ok(())
+}
+
+pub fn ensure_gitignore_entry(repo_root: &Path, entry: &str) -> Result<()> {
+    let gitignore = repo_root.join(".gitignore");
+    let content = std::fs::read_to_string(&gitignore).unwrap_or_default();
+    if content.lines().any(|l| l.trim() == entry) {
+        return Ok(());
+    }
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&gitignore)?;
+    if !content.is_empty() && !content.ends_with('\n') {
+        writeln!(f)?;
+    }
+    writeln!(f, "{entry}")?;
     Ok(())
 }
 
