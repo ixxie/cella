@@ -16,4 +16,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 tracing-appender = "0.2"
 libc = "0.2"
+russh = "0.54"
 flow = { path = "../flow" }

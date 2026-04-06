@@ -11,6 +11,7 @@ mod secrets;
 mod proxy;
 mod remote;
 mod transport;
+mod ssh;
 mod vm;
 mod worktree;
 
