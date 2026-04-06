@@ -63,6 +63,14 @@ pub fn add(repo: &git::Repo, branch: &str) -> Result<PathBuf> {
     std::fs::create_dir_all(&trees)?;
 
     repo.worktree_add(&path, branch)?;
+
+    if path.join(".envrc").exists() {
+        std::process::Command::new("direnv")
+            .args(["allow", path.to_str().unwrap()])
+            .status()
+            .ok();
+    }
+
     Ok(path)
 }
 
