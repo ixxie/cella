@@ -167,5 +167,32 @@ with lib; {
         default = [];
       };
     };
+
+    sweep = {
+      timeout = mkOption {
+        type = types.int;
+        default = 21600;
+        description = "Server-side sweep timeout in seconds. Stops VMs where the current op exceeds this (default: 6h).";
+      };
+      interval = mkOption {
+        type = types.int;
+        default = 300;
+        description = "How often to run the sweep check in seconds (default: 5m).";
+      };
+    };
+
+    gc = {
+      enable = mkEnableOption "Automatic garbage collection of stopped cells";
+      interval = mkOption {
+        type = types.str;
+        default = "daily";
+        description = "systemd calendar expression for GC runs (e.g. \"daily\", \"hourly\", \"*-*-* 03:00:00\").";
+      };
+      olderThan = mkOption {
+        type = types.str;
+        default = "7d";
+        description = "Delete stopped cells older than this duration (e.g. \"7d\", \"24h\").";
+      };
+    };
   };
 }

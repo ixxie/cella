@@ -19,7 +19,17 @@ pub struct ProxyConfig {
     pub log_file: String,
     #[serde(rename = "bindAddress")]
     pub bind_address: String,
+    /// Server-side sweep timeout in seconds (default: 6h = 21600).
+    /// Stops VMs where the current op has been running longer than this.
+    #[serde(rename = "sweepTimeout", default = "default_sweep_timeout")]
+    pub sweep_timeout: u64,
+    /// How often to run the sweep, in seconds (default: 5m = 300).
+    #[serde(rename = "sweepInterval", default = "default_sweep_interval")]
+    pub sweep_interval: u64,
 }
+
+fn default_sweep_timeout() -> u64 { 6 * 3600 }
+fn default_sweep_interval() -> u64 { 300 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct EgressConfig {
@@ -737,6 +747,47 @@ async fn serve_control_api(listener: tokio::net::TcpListener) {
     }
 }
 
+// Sweep — stop stale cells where the op has exceeded the server timeout
+
+async fn sweep_stale_cells(timeout: u64) {
+    let now = flow::now_secs();
+    let cells = match crate::vm::list_cells() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    for name in cells {
+        if !crate::vm::is_running(&name).unwrap_or(false) {
+            continue;
+        }
+
+        let status_path = crate::cell::cell_dir(&name).join("flow-status.json");
+        let info: Option<FlowInfo> = std::fs::read_to_string(&status_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok());
+
+        if let Some(info) = info {
+            if info.state == "running" && info.op_started_at > 0 {
+                let elapsed = now.saturating_sub(info.op_started_at);
+                if elapsed > timeout {
+                    eprintln!("sweep: stopping stale cell '{}' (op '{}' running for {}s, timeout {}s)",
+                        name, info.current_op, elapsed, timeout);
+                    crate::vm::stop(&name).ok();
+                }
+            }
+        }
+    }
+}
+
+async fn run_sweep_loop(interval: u64, timeout: u64) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval));
+    ticker.tick().await; // skip first immediate tick
+    loop {
+        ticker.tick().await;
+        sweep_stale_cells(timeout).await;
+    }
+}
+
 // Main entry point
 
 pub async fn run(config_path: &str) -> Result<()> {
@@ -767,6 +818,9 @@ pub async fn run(config_path: &str) -> Result<()> {
     eprintln!("Control API listening on {ctrl_local} + {ctrl_bridge}");
     tokio::spawn(serve_control_api(ctrl_listener_local));
     tokio::spawn(serve_control_api(ctrl_listener_bridge));
+
+    // Sweep loop — stops stale cells
+    tokio::spawn(run_sweep_loop(config.sweep_interval, config.sweep_timeout));
 
     eprintln!("Cella services started");
     eprintln!("  Git credentials: {git_addr}");

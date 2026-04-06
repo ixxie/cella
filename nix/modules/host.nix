@@ -44,6 +44,8 @@ with lib; let
     controlPort = cfg.proxy.controlPort;
     logFile = cfg.proxy.logFile;
     bindAddress = cfg.bridge.address;
+    sweepTimeout = cfg.sweep.timeout;
+    sweepInterval = cfg.sweep.interval;
   };
 in {
   imports = [
