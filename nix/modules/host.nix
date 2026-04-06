@@ -257,6 +257,25 @@ in {
       };
     };
 
+    # Optional GC timer for stopped cells
+    systemd.services.cella-gc = mkIf cfg.gc.enable {
+      description = "Cella garbage collection";
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = "${pkgs.cella}/bin/cella server gc --older-than ${cfg.gc.olderThan}";
+      };
+      path = [pkgs.cella];
+    };
+
+    systemd.timers.cella-gc = mkIf cfg.gc.enable {
+      description = "Periodic cella garbage collection";
+      wantedBy = ["timers.target"];
+      timerConfig = {
+        OnCalendar = cfg.gc.interval;
+        Persistent = true;
+      };
+    };
+
     # Scoped sudo for VM management
     security.sudo.extraRules = [
       {
