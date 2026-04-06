@@ -395,29 +395,34 @@ async fn handle_flow_start(req: &str) -> (&'static str, String) {
             .trim().to_string();
         let workspace = format!("/{repo_name}");
         let inner_cmd = match params {
-            Some(ref p) => format!("cellx flow run {flow} --params {}", crate::exec::shell_escape(p)),
-            None => format!("cellx flow run {flow}"),
+            Some(ref p) => format!("cellx flow run {} --params {}", flow, crate::exec::shell_escape(p)),
+            None => format!("cellx flow run {}", flow),
         };
         let detached = crate::exec::detached(&inner_cmd, "/tmp/cellx/flow.log");
         let script = format!("cd {} && {}", crate::exec::shell_escape(&workspace), detached);
 
-        eprintln!("flow-start: target={target} cmd={script}");
+        eprintln!("flow-start: target={target} script={script}");
 
-        // fire-and-forget: spawn SSH, don't wait for exit
-        // SSH already runs the command through a remote shell, so no sh -c wrapper needed
-        std::process::Command::new("ssh")
+        // Pipe script via stdin to avoid shell escaping issues with nested quotes
+        use std::io::Write;
+        let mut child = std::process::Command::new("ssh")
             .args([
+                "-T",
                 "-o", "StrictHostKeyChecking=no",
                 "-o", "UserKnownHostsFile=/dev/null",
                 "-o", "LogLevel=ERROR",
                 &target,
-                &script,
             ])
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .stdin(std::process::Stdio::null())
             .spawn()
             .map_err(|e| anyhow::anyhow!("failed to start flow: {e}"))?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(script.as_bytes()).ok();
+            stdin.write_all(b"\n").ok();
+        }
 
         Ok(())
     }).await;
