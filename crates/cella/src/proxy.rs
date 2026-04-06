@@ -375,6 +375,12 @@ async fn handle_list() -> (&'static str, String) {
     }
 }
 
+/// Connect to a cell VM via russh
+async fn cell_session(name: &str) -> anyhow::Result<crate::ssh::Session> {
+    let (_, target) = crate::vm::ssh_target(name)?;
+    crate::ssh::Session::connect(&target).await
+}
+
 async fn handle_flow_start(req: &str) -> (&'static str, String) {
     let body = match req.find("\r\n\r\n") {
         Some(i) => &req[i + 4..],
@@ -388,48 +394,31 @@ async fn handle_flow_start(req: &str) -> (&'static str, String) {
     let name = fr.name;
     let flow = fr.flow;
     let params = fr.params;
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let (_, target) = crate::vm::ssh_target(&name)?;
-        let repo_name = std::fs::read_to_string(crate::vm::runtime_dir(&name).join("repo"))
-            .unwrap_or_else(|_| "cell".to_string())
-            .trim().to_string();
-        let workspace = format!("/{repo_name}");
-        let inner_cmd = match params {
-            Some(ref p) => format!("cellx flow run {} --params {}", flow, crate::exec::shell_escape(p)),
-            None => format!("cellx flow run {}", flow),
-        };
-        let detached = crate::exec::detached(&inner_cmd, "/tmp/cellx/flow.log");
-        let script = format!("cd {} && {}", crate::exec::shell_escape(&workspace), detached);
 
-        eprintln!("flow-start: target={target} script={script}");
+    let repo_name = std::fs::read_to_string(crate::vm::runtime_dir(&name).join("repo"))
+        .unwrap_or_else(|_| "cell".to_string())
+        .trim().to_string();
 
-        // Pipe script via stdin to avoid shell escaping issues with nested quotes
-        use std::io::Write;
-        let mut child = std::process::Command::new("ssh")
-            .args([
-                "-T",
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "UserKnownHostsFile=/dev/null",
-                "-o", "LogLevel=ERROR",
-                &target,
-            ])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("failed to start flow: {e}"))?;
+    // Build the command — no shell escaping needed, russh passes it directly
+    let cmd = match params {
+        Some(ref p) => format!(
+            "cd /{repo_name} && mkdir -p /tmp/cellx && nohup cellx flow run {flow} --params '{}' > /tmp/cellx/flow.log 2>&1 &",
+            p.replace('\'', "'\\''")
+        ),
+        None => format!(
+            "cd /{repo_name} && mkdir -p /tmp/cellx && nohup cellx flow run {flow} > /tmp/cellx/flow.log 2>&1 &"
+        ),
+    };
 
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(script.as_bytes()).ok();
-            stdin.write_all(b"\n").ok();
-        }
+    eprintln!("flow-start: cell={name} cmd={cmd}");
 
-        Ok(())
-    }).await;
+    let session = match cell_session(&name).await {
+        Ok(s) => s,
+        Err(e) => return ("500 Internal Server Error", format!("{{\"ok\":false,\"error\":\"ssh: {e}\"}}")),
+    };
 
-    match result {
-        Ok(Ok(())) => ("200 OK", r#"{"ok":true}"#.to_string()),
-        Ok(Err(e)) => ("500 Internal Server Error", format!("{{\"ok\":false,\"error\":\"{e}\"}}")),
+    match session.exec_detached(&cmd, None).await {
+        Ok(()) => ("200 OK", r#"{"ok":true}"#.to_string()),
         Err(e) => ("500 Internal Server Error", format!("{{\"ok\":false,\"error\":\"{e}\"}}")),
     }
 }
@@ -444,32 +433,12 @@ async fn handle_flow_stop(req: &str) -> (&'static str, String) {
         Err(e) => return ("400 Bad Request", format!("bad request: {e}")),
     };
 
-    let name = nr.name;
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let (_, target) = crate::vm::ssh_target(&name)?;
-        // fire-and-forget: cellx flow done writes a result file, quick operation
-        std::process::Command::new("ssh")
-            .args([
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "UserKnownHostsFile=/dev/null",
-                "-o", "LogLevel=ERROR",
-                "-o", "ConnectTimeout=5",
-                &target,
-                "cellx flow done",
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .stdin(std::process::Stdio::null())
-            .status()
-            .ok();
-        Ok(())
-    }).await;
-
-    match result {
-        Ok(Ok(())) => ("200 OK", r#"{"ok":true}"#.to_string()),
-        Ok(Err(e)) => ("500 Internal Server Error", format!("{{\"ok\":false,\"error\":\"{e}\"}}")),
-        Err(e) => ("500 Internal Server Error", format!("{{\"ok\":false,\"error\":\"{e}\"}}")),
-    }
+    let session = match cell_session(&nr.name).await {
+        Ok(s) => s,
+        Err(e) => return ("500 Internal Server Error", format!("{{\"ok\":false,\"error\":\"ssh: {e}\"}}")),
+    };
+    session.exec("cellx flow done").await.ok();
+    ("200 OK", r#"{"ok":true}"#.to_string())
 }
 
 async fn handle_flow_pause(req: &str) -> (&'static str, String) {
@@ -482,31 +451,12 @@ async fn handle_flow_pause(req: &str) -> (&'static str, String) {
         Err(e) => return ("400 Bad Request", format!("bad request: {e}")),
     };
 
-    let name = nr.name;
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let (_, target) = crate::vm::ssh_target(&name)?;
-        std::process::Command::new("ssh")
-            .args([
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "UserKnownHostsFile=/dev/null",
-                "-o", "LogLevel=ERROR",
-                "-o", "ConnectTimeout=5",
-                &target,
-                "cellx flow pause",
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .stdin(std::process::Stdio::null())
-            .status()
-            .ok();
-        Ok(())
-    }).await;
-
-    match result {
-        Ok(Ok(())) => ("200 OK", r#"{"ok":true}"#.to_string()),
-        Ok(Err(e)) => ("500 Internal Server Error", format!("{{\"ok\":false,\"error\":\"{e}\"}}")),
-        Err(e) => ("500 Internal Server Error", format!("{{\"ok\":false,\"error\":\"{e}\"}}")),
-    }
+    let session = match cell_session(&nr.name).await {
+        Ok(s) => s,
+        Err(e) => return ("500 Internal Server Error", format!("{{\"ok\":false,\"error\":\"ssh: {e}\"}}")),
+    };
+    session.exec("cellx flow pause").await.ok();
+    ("200 OK", r#"{"ok":true}"#.to_string())
 }
 
 async fn handle_flow_logs(req: &str) -> (&'static str, String) {
@@ -519,29 +469,17 @@ async fn handle_flow_logs(req: &str) -> (&'static str, String) {
         Err(e) => return ("400 Bad Request", format!("bad request: {e}")),
     };
 
-    let name = lr.name;
     let lines = lr.lines;
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
-        let (_, target) = crate::vm::ssh_target(&name)?;
-        let output = std::process::Command::new("ssh")
-            .args([
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "UserKnownHostsFile=/dev/null",
-                "-o", "LogLevel=ERROR",
-                &target,
-                &format!("tail -{lines} /tmp/cellx/flow.log 2>/dev/null"),
-            ])
-            .output()
-            .map_err(|e| anyhow::anyhow!("ssh failed: {e}"))?;
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    }).await;
+    let session = match cell_session(&lr.name).await {
+        Ok(s) => s,
+        Err(e) => return ("500 Internal Server Error", format!("{{\"ok\":false,\"error\":\"ssh: {e}\"}}")),
+    };
 
-    match result {
-        Ok(Ok(content)) => {
+    match session.exec(&format!("tail -{lines} /tmp/cellx/flow.log 2>/dev/null")).await {
+        Ok((content, _)) => {
             let resp = serde_json::json!({"ok": true, "content": content});
             ("200 OK", resp.to_string())
         }
-        Ok(Err(e)) => ("500 Internal Server Error", format!("{{\"ok\":false,\"error\":\"{e}\"}}")),
         Err(e) => ("500 Internal Server Error", format!("{{\"ok\":false,\"error\":\"{e}\"}}")),
     }
 }
@@ -568,9 +506,8 @@ async fn handle_flow_logs_follow(
         }
     };
 
-    let name = lr.name.clone();
-    let target = match tokio::task::spawn_blocking(move || crate::vm::ssh_target(&name)).await {
-        Ok(Ok((_, t))) => t,
+    let session = match cell_session(&lr.name).await {
+        Ok(s) => s,
         _ => {
             let _ = stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 16\r\n\r\ncannot reach cell").await;
             return;
@@ -580,40 +517,34 @@ async fn handle_flow_logs_follow(
     // send chunked transfer header
     let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n").await;
 
-    // spawn tail -f and pipe output
-    let mut child = match tokio::process::Command::new("ssh")
-        .args([
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "UserKnownHostsFile=/dev/null",
-            "-o", "LogLevel=ERROR",
-            &target,
-            "tail -f /tmp/cellx/flow.log 2>/dev/null & TAIL=$!; while kill -0 $TAIL 2>/dev/null; do if [ ! -f /tmp/cellx/flow.json ]; then kill $TAIL 2>/dev/null; break; fi; sleep 1; done; wait $TAIL 2>/dev/null",
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
+    // Execute tail -f via russh exec channel and pipe output
+    let tail_cmd = "tail -f /tmp/cellx/flow.log 2>/dev/null & TAIL=$!; while kill -0 $TAIL 2>/dev/null; do if [ ! -f /tmp/cellx/flow.json ]; then kill $TAIL 2>/dev/null; break; fi; sleep 1; done; wait $TAIL 2>/dev/null";
+    let mut channel = match session.handle.channel_open_session().await {
         Ok(c) => c,
         Err(_) => return,
     };
+    if channel.exec(true, tail_cmd).await.is_err() {
+        return;
+    }
 
-    if let Some(mut stdout) = child.stdout.take() {
-        use tokio::io::AsyncReadExt;
-        let mut buf = vec![0u8; 4096];
-        loop {
-            let n = match stdout.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
-            };
-            let chunk = format!("{:x}\r\n", n);
-            if stream.write_all(chunk.as_bytes()).await.is_err() { break; }
-            if stream.write_all(&buf[..n]).await.is_err() { break; }
-            if stream.write_all(b"\r\n").await.is_err() { break; }
+    // Pipe channel data as chunked HTTP
+    while let Some(msg) = channel.wait().await {
+        if let russh::ChannelMsg::Data { ref data } = msg {
+            let chunk_header = format!("{:x}\r\n", data.len());
+            if stream.write_all(chunk_header.as_bytes()).await.is_err() {
+                break;
+            }
+            if stream.write_all(data).await.is_err() {
+                break;
+            }
+            if stream.write_all(b"\r\n").await.is_err() {
+                break;
+            }
+            stream.flush().await.ok();
         }
     }
 
     let _ = stream.write_all(b"0\r\n\r\n").await;
-    child.kill().await.ok();
 }
 
 async fn handle_flow_status(req: &str) -> (&'static str, String) {
