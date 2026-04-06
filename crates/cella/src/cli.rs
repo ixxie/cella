@@ -3,7 +3,7 @@ use clap::{Args, Parser, Subcommand};
 use console::{style, Style};
 
 use tracing::instrument;
-use crate::{client, config, deploy, git, server, proxy, secrets, transport, vm};
+use crate::{client, config, deploy, git, server, proxy, secrets, transport, vm, worktree};
 use crate::transport::Transport;
 
 #[derive(Parser)]
@@ -21,41 +21,43 @@ struct Cli {
 enum Commands {
     /// Scaffold .cella/ for a repo
     Init,
-    /// Start or resume a flow
-    Run(RunArgs),
-    /// Pause the running flow (cell stays up)
-    Pause {
-        /// Cell name
-        cell: String,
-    },
-    /// Stop flow and shut down cell
-    Stop(StopArgs),
-    /// Show flow status
-    Status {
-        /// Cell name (omit for all active flows)
-        cell: Option<String>,
-    },
-    /// SSH into a cell
-    Shell(ShellArgs),
-    /// List cells and their status
+    /// Create a new branch and add it to cella
+    Create(CreateArgs),
+    /// Add an existing branch to cella
+    Add(AddArgs),
+    /// Remove a branch from cella
+    Remove(RemoveArgs),
+    /// List cella-managed branches
     List {
         /// Show cells from all repos
         #[arg(short, long)]
         all: bool,
     },
+    /// Print worktree path for a branch
+    Path {
+        /// Branch name
+        name: String,
+    },
+    /// Start or resume a flow
+    Run(RunArgs),
+    /// Pause the running flow (cell stays up)
+    Pause {
+        /// Branch name (optional if in worktree)
+        name: Option<String>,
+    },
+    /// Stop flow and shut down cell
+    Stop(StopArgs),
+    /// Show flow status
+    Status {
+        /// Branch name (omit for all)
+        name: Option<String>,
+    },
+    /// SSH into a cell
+    Shell(ShellArgs),
     /// View flow output from a cell
     Logs(LogsArgs),
     /// Forward declared ports from a remote cell to localhost
-    Tunnel {
-        /// Cell name
-        name: String,
-        /// Ports to forward, supports ranges (e.g. -p 5173 -p 8001-8004)
-        #[arg(short, long)]
-        port: Vec<String>,
-        /// Open in default browser
-        #[arg(short, long)]
-        open: bool,
-    },
+    Tunnel(TunnelArgs),
     /// Manage encrypted secrets
     Secrets(SecretsArgs),
     /// Manage servers
@@ -66,18 +68,45 @@ enum Commands {
 }
 
 #[derive(Args, Debug)]
+struct CreateArgs {
+    /// Branch name to create
+    name: String,
+    /// Server to use
+    #[arg(short, long)]
+    server: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct AddArgs {
+    /// Existing branch name
+    name: String,
+    /// Server to use
+    #[arg(short, long)]
+    server: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct RemoveArgs {
+    /// Branch name
+    name: String,
+    /// Also delete the git branch
+    #[arg(short, long)]
+    delete: bool,
+}
+
+#[derive(Args, Debug)]
 struct RunArgs {
     /// Flow name (matches .cella/flows/{name}/)
     name: Option<String>,
-    /// Cell name (defaults to current branch)
+    /// Branch name (optional if in worktree)
     #[arg(short, long)]
-    cell: Option<String>,
+    branch: Option<String>,
     /// Server to run on
     #[arg(short, long)]
     server: Option<String>,
-    /// Attach to flow output (default is detached)
+    /// Detach from flow output (default is attached)
     #[arg(short, long)]
-    attach: bool,
+    detach: bool,
     /// Params as key=value pairs (e.g. cella run dev -- project="my project")
     #[arg(last = true)]
     params: Vec<String>,
@@ -85,17 +114,17 @@ struct RunArgs {
 
 #[derive(Args, Debug)]
 struct StopArgs {
-    /// Cell name
-    cell: String,
-    /// Also delete the cell and its branch
+    /// Branch name (optional if in worktree)
+    name: Option<String>,
+    /// Also remove from cella (tear down worktree + cell)
     #[arg(short, long)]
     delete: bool,
 }
 
 #[derive(Args)]
 struct ShellArgs {
-    /// Cell name
-    name: String,
+    /// Branch name (optional if in worktree)
+    name: Option<String>,
     /// Run a command instead of interactive shell
     #[arg(short = 'c', long = "command")]
     command: Option<String>,
@@ -106,11 +135,23 @@ struct ShellArgs {
 
 #[derive(Args)]
 struct LogsArgs {
-    /// Cell name
-    cell: String,
+    /// Branch name (optional if in worktree)
+    name: Option<String>,
     /// Follow log output
     #[arg(short, long)]
     follow: bool,
+}
+
+#[derive(Args)]
+struct TunnelArgs {
+    /// Branch name (optional if in worktree)
+    name: Option<String>,
+    /// Ports to forward, supports ranges (e.g. -p 5173 -p 8001-8004)
+    #[arg(short, long)]
+    port: Vec<String>,
+    /// Open in default browser
+    #[arg(short, long)]
+    open: bool,
 }
 
 #[derive(Args)]
@@ -237,6 +278,8 @@ fn flow_state(s: &str) -> String {
     }
 }
 
+// Dispatch
+
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
 
@@ -255,24 +298,65 @@ pub fn run() -> Result<()> {
             UtilAction::ResolveCell { repo } => cmd_resolve_cell(repo.as_deref()),
             UtilAction::Hosts { action } => cmd_hosts(action),
         },
-        Commands::Shell(args) => cmd_shell(args),
-        Commands::List { all } => cmd_list(git::Repo::open().ok().as_ref(), all),
-        cmd => {
+
+        // commands that don't need cell context
+        Commands::Init => {
             let repo = git::Repo::open()?;
-            match cmd {
-                Commands::Init => cmd_init(&repo),
-                Commands::Run(args) => cmd_run(&repo, args),
-                Commands::Pause { cell } => cmd_pause(&repo, &cell),
-                Commands::Stop(args) => cmd_stop(&repo, args),
-                Commands::Status { cell } => cmd_status(&repo, cell.as_deref()),
-                Commands::Logs(args) => cmd_logs(&repo, args),
-                Commands::Tunnel { name, port, open } => {
-                    let ports = if port.is_empty() { vec![] } else { parse_ports(&port)? };
-                    cmd_tunnel(&repo, &name, &ports, open)
-                }
-                Commands::Secrets(args) => cmd_secrets(&repo, args),
-                _ => unreachable!(),
-            }
+            cmd_init(&repo)
+        }
+        Commands::Create(args) => {
+            let repo = git::Repo::open()?;
+            cmd_create(&repo, args)
+        }
+        Commands::Add(args) => {
+            let repo = git::Repo::open()?;
+            cmd_add(&repo, args)
+        }
+        Commands::Remove(args) => {
+            let repo = git::Repo::open()?;
+            cmd_remove(&repo, args)
+        }
+        Commands::List { all } => cmd_list(git::Repo::open().ok().as_ref(), all),
+        Commands::Path { name } => {
+            let repo = git::Repo::open()?;
+            cmd_path(&repo, &name)
+        }
+        Commands::Status { name } => {
+            let repo = git::Repo::open()?;
+            cmd_status(&repo, name.as_deref())
+        }
+        Commands::Secrets(args) => {
+            let repo = git::Repo::open()?;
+            cmd_secrets(&repo, args)
+        }
+
+        // commands that need cell context (resolve from worktree or explicit arg)
+        Commands::Shell(args) if args.server => {
+            vm::shell(&args.name.unwrap_or_default(), args.command.as_deref())
+        }
+        Commands::Run(args) => {
+            let (repo, cell) = worktree::resolve_cell(args.branch.as_deref())?;
+            cmd_run(&repo, &cell, args)
+        }
+        Commands::Stop(args) => {
+            let (repo, cell) = worktree::resolve_cell(args.name.as_deref())?;
+            cmd_stop(&repo, &cell, args)
+        }
+        Commands::Pause { name } => {
+            let (repo, cell) = worktree::resolve_cell(name.as_deref())?;
+            cmd_pause(&repo, &cell)
+        }
+        Commands::Logs(args) => {
+            let (repo, cell) = worktree::resolve_cell(args.name.as_deref())?;
+            cmd_logs(&repo, &cell, args)
+        }
+        Commands::Shell(args) => {
+            let (repo, cell) = worktree::resolve_cell(args.name.as_deref())?;
+            cmd_shell(&repo, &cell, args)
+        }
+        Commands::Tunnel(args) => {
+            let (repo, cell) = worktree::resolve_cell(args.name.as_deref())?;
+            cmd_tunnel(&repo, &cell, args)
         }
     }
 }
@@ -344,8 +428,77 @@ fn cmd_init(repo: &git::Repo) -> Result<()> {
         println!("  {} .cella/config.toml", add());
     }
 
+    git::ensure_gitignore_entry(repo.root(), ".cella/trees/")?;
+
     repo.add_cella_remote("cella://localhost")?;
     println!("{} initialized cella", ok());
+    Ok(())
+}
+
+// Branch lifecycle commands
+
+fn cmd_create(repo: &git::Repo, args: CreateArgs) -> Result<()> {
+    let name = &args.name;
+    if repo.branch_exists(name) {
+        anyhow::bail!("branch '{name}' already exists — use 'cella add {name}' instead");
+    }
+
+    repo.create_branch(name)?;
+    println!("  {} branch {}", add(), bold(name));
+
+    let path = worktree::add(repo, name)?;
+    println!("  {} worktree at {}", add(), dim(&path.display().to_string()));
+
+    println!("{} created {}", ok(), bold(name));
+    Ok(())
+}
+
+fn cmd_add(repo: &git::Repo, args: AddArgs) -> Result<()> {
+    let name = &args.name;
+    if !repo.branch_exists(name) {
+        anyhow::bail!("branch '{name}' does not exist — use 'cella create {name}' to create it");
+    }
+
+    let path = worktree::add(repo, name)?;
+    println!("  {} worktree at {}", add(), dim(&path.display().to_string()));
+
+    println!("{} added {}", ok(), bold(name));
+    Ok(())
+}
+
+fn cmd_remove(repo: &git::Repo, args: RemoveArgs) -> Result<()> {
+    let name = &args.name;
+
+    // stop cell if running
+    if let Ok(active) = find_cell_server(repo, name) {
+        let t = make_transport(&active)?;
+        t.flow_stop(name).ok();
+        if active.is_server() {
+            let c = connect_remote(&active)?;
+            c.delete(name).ok();
+        } else if vm::is_running(name).unwrap_or(false) {
+            vm::stop(name)?;
+        }
+    }
+
+    worktree::remove(repo, name)?;
+    println!("  {} worktree removed", rm());
+
+    if args.delete {
+        repo.delete_branch(name).ok();
+        println!("  {} branch deleted", rm());
+    }
+
+    println!("{} removed {}", ok(), bold(name));
+    Ok(())
+}
+
+fn cmd_path(repo: &git::Repo, name: &str) -> Result<()> {
+    let path = worktree::tree_path(repo.root(), name);
+    if !path.exists() {
+        anyhow::bail!("no worktree for '{name}' — use 'cella add {name}' first");
+    }
+    println!("{}", path.display());
     Ok(())
 }
 
@@ -405,62 +558,42 @@ fn cmd_resolve_cell(repo_filter: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-#[instrument(skip(repo), fields(cell = %args.cell))]
-fn cmd_stop(repo: &git::Repo, args: StopArgs) -> Result<()> {
-    let active = find_cell_server(repo, &args.cell)?;
+#[instrument(skip(repo), fields(cell = %cell))]
+fn cmd_stop(repo: &git::Repo, cell: &str, args: StopArgs) -> Result<()> {
+    let active = find_cell_server(repo, cell)?;
     let t = make_transport(&active)?;
 
-    t.flow_stop(&args.cell).ok();
+    t.flow_stop(cell).ok();
 
     if active.is_server() {
         let c = connect_remote(&active)?;
-        if args.delete {
-            c.delete(&args.cell)?;
-            repo.delete_branch(&args.cell).ok();
-            repo.remove_clone(&args.cell).ok();
-            println!("{} deleted {}", rm(), bold(&args.cell));
-        } else {
-            c.down(&args.cell)?;
-            println!("{} stopped {}", dn(), bold(&args.cell));
-        }
-        return Ok(());
+        c.down(cell)?;
+        println!("{} stopped {}", dn(), bold(cell));
+    } else if vm::is_running(cell).unwrap_or(false) {
+        vm::stop(cell)?;
+        println!("{} stopped {}", dn(), bold(cell));
+    } else {
+        println!("  {} not running", bold(cell));
     }
 
     if args.delete {
-        if vm::is_running(&args.cell)? {
-            vm::stop(&args.cell)?;
-        }
-        repo.remove_clone(&args.cell)?;
-        repo.delete_branch(&args.cell).ok();
-        println!("{} deleted {}", rm(), bold(&args.cell));
-    } else {
-        if vm::is_running(&args.cell)? {
-            vm::stop(&args.cell)?;
-            println!("{} stopped {}", dn(), bold(&args.cell));
-        } else {
-            println!("  {} not running", bold(&args.cell));
-        }
+        cmd_remove(repo, RemoveArgs {
+            name: cell.to_string(),
+            delete: true,
+        })?;
     }
     Ok(())
 }
 
-#[instrument(skip_all, fields(cell = %args.name))]
-fn cmd_shell(args: ShellArgs) -> Result<()> {
-    if args.server {
-        return vm::shell(&args.name, args.command.as_deref());
-    }
+#[instrument(skip_all, fields(cell = %cell))]
+fn cmd_shell(repo: &git::Repo, cell: &str, args: ShellArgs) -> Result<()> {
+    let active = find_cell_server(repo, cell)?;
+    let cfg = config::load(repo.root())?;
+    let t = make_transport(&active)?;
+    t.ensure_running(cell, repo, &cfg)?;
 
-    if let Ok(repo) = git::Repo::open() {
-        let active = find_cell_server(&repo, &args.name)?;
-        let cfg = config::load(repo.root())?;
-        let t = make_transport(&active)?;
-        t.ensure_running(&args.name, &repo, &cfg)?;
-
-        println!("{} entering {}", arrow(), bold(&args.name));
-        return t.shell(&args.name, args.command.as_deref());
-    }
-
-    vm::shell(&args.name, args.command.as_deref())
+    println!("{} entering {}", arrow(), bold(cell));
+    t.shell(cell, args.command.as_deref())
 }
 
 fn cmd_list(repo: Option<&git::Repo>, show_all: bool) -> Result<()> {
@@ -636,23 +769,24 @@ fn cleanup_tunnel_dns(loopback: &str, dns: &str) {
         .output().ok();
 }
 
-fn cmd_tunnel(repo: &git::Repo, name: &str, cli_ports: &[u16], open: bool) -> Result<()> {
+fn cmd_tunnel(repo: &git::Repo, cell: &str, args: TunnelArgs) -> Result<()> {
     let cfg = config::load(repo.root())?;
-    let ports = if cli_ports.is_empty() { &cfg.ports } else { cli_ports };
+    let cli_ports = if args.port.is_empty() { vec![] } else { parse_ports(&args.port)? };
+    let ports = if cli_ports.is_empty() { &cfg.ports } else { &cli_ports };
     if ports.is_empty() {
         anyhow::bail!("no ports specified — use -p 5173 or add ports = [5173] to .cella/config.toml");
     }
 
-    let active = find_cell_server(repo, name)?;
+    let active = find_cell_server(repo, cell)?;
     let target = active.target()?
         .ok_or_else(|| anyhow::anyhow!("tunnel is for remote hosts — ports are already accessible locally"))?;
 
     let c = connect_remote(&active)?;
     let cells = c.list()?;
-    let cell = cells.iter().find(|c| c.name == name)
-        .ok_or_else(|| anyhow::anyhow!("cell '{name}' not found on server"))?;
-    let vm_ip = cell.ip.as_deref()
-        .ok_or_else(|| anyhow::anyhow!("cell '{name}' has no IP (not running?)"))?;
+    let found = cells.iter().find(|c| c.name == cell)
+        .ok_or_else(|| anyhow::anyhow!("cell '{cell}' not found on server"))?;
+    let vm_ip = found.ip.as_deref()
+        .ok_or_else(|| anyhow::anyhow!("cell '{cell}' has no IP (not running?)"))?;
 
     let loopback = derive_loopback(vm_ip)
         .ok_or_else(|| anyhow::anyhow!("cannot derive loopback from IP '{vm_ip}'"))?;
@@ -661,7 +795,7 @@ fn cmd_tunnel(repo: &git::Repo, name: &str, cli_ports: &[u16], open: bool) -> Re
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("unknown");
-    let dns = vm::dns_hostname(name, repo_name);
+    let dns = vm::dns_hostname(cell, repo_name);
 
     let has_dns = setup_tunnel_dns(&loopback, &dns);
     let bind_addr = if has_dns { &loopback } else { "127.0.0.1" };
@@ -679,13 +813,13 @@ fn cmd_tunnel(repo: &git::Repo, name: &str, cli_ports: &[u16], open: bool) -> Re
         format!("http://127.0.0.1:{}", ports[0])
     };
     let ports_str: Vec<String> = ports.iter().map(|p| p.to_string()).collect();
-    println!("{} tunneling {} port {} → {url}", style("⇄").cyan(), bold(name), ports_str.join(", "));
+    println!("{} tunneling {} port {} → {url}", style("⇄").cyan(), bold(cell), ports_str.join(", "));
     if !has_dns {
         println!("  {}", dim(".cell DNS not available — using localhost"));
     }
     println!("  {}", dim("press ctrl+c to close"));
 
-    if open {
+    if args.open {
         std::process::Command::new("xdg-open")
             .arg(&url)
             .spawn()
@@ -750,10 +884,10 @@ fn cmd_hosts(action: HostsAction) -> Result<()> {
     Ok(())
 }
 
-fn cmd_logs(repo: &git::Repo, args: LogsArgs) -> Result<()> {
-    let active = find_cell_server(repo, &args.cell)?;
+fn cmd_logs(repo: &git::Repo, cell: &str, args: LogsArgs) -> Result<()> {
+    let active = find_cell_server(repo, cell)?;
     let t = make_transport(&active)?;
-    t.flow_logs(&args.cell, args.follow)
+    t.flow_logs(cell, args.follow)
 }
 
 fn cmd_secrets(repo: &git::Repo, args: SecretsArgs) -> Result<()> {
@@ -777,9 +911,7 @@ fn cmd_secrets(repo: &git::Repo, args: SecretsArgs) -> Result<()> {
 // Flow commands
 
 #[instrument(skip(repo))]
-fn cmd_run(repo: &git::Repo, args: RunArgs) -> Result<()> {
-    let branch = repo.current_branch()?;
-    let cell = args.cell.as_deref().unwrap_or(&branch);
+fn cmd_run(repo: &git::Repo, cell: &str, args: RunArgs) -> Result<()> {
     let cfg = config::load(repo.root())?;
 
     let client_cfg = server::load_client_config();
@@ -795,13 +927,10 @@ fn cmd_run(repo: &git::Repo, args: RunArgs) -> Result<()> {
     let t = make_transport(&active)?;
     t.ensure_running(cell, repo, &cfg)?;
 
-    // determine flow name: explicit, or resume from paused state, or default
     let flow_name = if let Some(ref name) = args.name {
         name.clone()
     } else {
-        // check for paused flow to resume
         let status_path = if active.is_server() {
-            // for remote, we'd need to query — for now require explicit name
             None
         } else {
             Some(crate::cell::cell_dir(cell).join("flow-status.json"))
@@ -839,10 +968,10 @@ fn cmd_run(repo: &git::Repo, args: RunArgs) -> Result<()> {
     };
     t.flow_start(cell, &flow_name, params_json.as_deref())?;
     println!("{} flow {} on {}", arrow(), bold(&flow_name), bold(cell));
-    if args.attach {
-        t.flow_logs(cell, true)?;
+    if args.detach {
+        println!("  {} cella logs -f", dim("follow:"));
     } else {
-        println!("  {} cella logs {} -f", dim("follow:"), cell);
+        t.flow_logs(cell, true)?;
     }
     Ok(())
 }
@@ -905,7 +1034,6 @@ fn cmd_status(repo: &git::Repo, cell: Option<&str>) -> Result<()> {
             }
         }
     } else {
-        // show all active flows
         cmd_list(Some(repo), false)?;
     }
     Ok(())

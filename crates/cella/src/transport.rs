@@ -6,7 +6,6 @@ use crate::{client, config, git, secrets, server, vm};
 
 fn ok() -> console::StyledObject<&'static str> { style("✓").green() }
 fn up_icon() -> console::StyledObject<&'static str> { style("▲").green() }
-fn add() -> console::StyledObject<&'static str> { style("+").green() }
 fn bold(s: &str) -> console::StyledObject<&str> { style(s).bold() }
 
 fn spinner(msg: &str) -> indicatif::ProgressBar {
@@ -48,9 +47,7 @@ impl Transport for LocalTransport {
         }
 
         if !repo.branch_exists(cell) {
-            let sp = spinner(&format!("creating branch {}", cell));
-            repo.create_branch(cell)?;
-            sp.finish_with_message(format!("{} created branch {}", add(), bold(cell)));
+            anyhow::bail!("branch '{cell}' does not exist — use 'cella create {cell}' first");
         }
 
         let sp = spinner(&format!("booting {}", cell));
@@ -121,9 +118,7 @@ impl Transport for RemoteTransport {
             .unwrap_or("unknown");
 
         if !repo.branch_exists(cell) {
-            let sp = spinner(&format!("creating branch {}", cell));
-            repo.create_branch(cell)?;
-            sp.finish_with_message(format!("{} created branch {}", add(), bold(cell)));
+            anyhow::bail!("branch '{cell}' does not exist — use 'cella create {cell}' first");
         }
 
         // prepare: init repo on server (no build)
