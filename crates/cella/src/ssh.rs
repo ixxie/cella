@@ -4,7 +4,7 @@ use russh::keys::ssh_key;
 use std::sync::Arc;
 
 /// SSH client handler (required by russh)
-struct Handler;
+pub(crate) struct Handler;
 
 impl client::Handler for Handler {
     type Error = anyhow::Error;
@@ -19,7 +19,7 @@ impl client::Handler for Handler {
 
 /// A connected SSH session
 pub struct Session {
-    handle: client::Handle<Handler>,
+    pub(crate) handle: client::Handle<Handler>,
 }
 
 impl Session {
