@@ -28,9 +28,11 @@ isolation, proxy-enforced network control. Runs on NixOS, deploys from any machi
 **Operations:**
 
 - **Dynamic cells** — each cell gets its own VM, IP, and DNS name on demand
+- **Branch-centric** — `cella create` sets up branch + worktree + cell; context is implicit from cwd
 - **Remote-transparent** — all commands work identically on local and remote hosts via SSH
 - **Deploy from anywhere** — `cella deploy` provisions NixOS on any VPS
 - **Composable VM config** — server-level and per-repo flakes with custom inputs are merged at cell creation
+- **TTL + GC** — op timeouts, server-side sweep for stale cells, manual or automated garbage collection
 - **Default server** — configurable at client or repo level, no `-s` flag needed
 
 ## Getting started
@@ -247,26 +249,78 @@ Auto-detects the target OS:
 On a NixOS machine, import the cella modules in your system flake
 and run cells locally.
 
-## Usage
+### Garbage collection
 
-All commands run from inside a git repo. Each cell is a branch that gets
-its own isolated VM with the repo mounted at `/<repo-name>`.
+Stopped cells accumulate on the server. Clean them up manually or on a timer.
 
 ```bash
-cella run dev -c feat              # create branch, boot VM, start flow
-cella run dev -a                   # attach to flow output
-cella run dev -- project="my app"  # pass params to the start op
-
-cella shell feat                   # SSH into a cell
-cella shell feat -c "make"         # run a command non-interactively
-
-cella stop feat                    # stop flow + cell
-cella stop feat -d                 # stop + delete branch and clone
-cella list                         # list cells and their status
-cella logs feat -f                 # follow flow output
-cella status feat                  # show flow state
-cella pause feat                   # pause flow, cell stays up
+cella server gc                    # delete cells stopped > 7 days
+cella server gc --older-than 24h   # custom threshold
+cella server gc --dry-run          # preview what would be deleted
 ```
+
+Enable automated GC in the server NixOS config:
+
+```nix
+cella.server.gc = {
+  enable = true;
+  interval = "daily";     # systemd calendar expression
+  olderThan = "7d";       # delete cells stopped longer than this
+};
+```
+
+The server also runs a **sweep** that stops VMs where the current op
+has exceeded a timeout (default 6h). This catches crashed clients:
+
+```nix
+cella.server.sweep = {
+  timeout = 21600;        # seconds (default: 6h)
+  interval = 300;         # check every 5 minutes
+};
+```
+
+## Usage
+
+All commands run from inside a git repo. Each cell is a branch with
+its own isolated VM, local worktree, and the repo mounted at `/<repo-name>`.
+
+### Branch lifecycle
+
+```bash
+cella create feat                  # new branch + worktree + cell
+cella add feat                     # adopt existing branch into cella
+cella remove feat                  # tear down worktree + cell
+cella remove feat -d               # also delete the git branch
+cella list                         # list cella-managed branches
+cella path feat                    # print worktree path
+```
+
+### Running flows
+
+From inside a worktree (`.cella/trees/feat/`), the branch is implicit:
+
+```bash
+cella run dev                      # start flow (attached by default)
+cella run dev -d                   # detach from output
+cella run dev -- project="my app"  # pass params to the start op
+cella logs -f                      # follow flow output
+cella status                       # show flow state
+cella pause                        # pause flow, cell stays up
+cella stop                         # stop flow + cell
+cella shell                        # SSH into the cell
+cella shell -c "make"              # run a command non-interactively
+```
+
+Or specify the branch explicitly from anywhere:
+
+```bash
+cella run dev -b feat -- project="my app"
+cella logs feat -f
+cella shell feat
+cella stop feat
+```
+
+### Git interaction
 
 Interact with agent work from the host through standard git:
 
@@ -312,6 +366,7 @@ with prompts and hook scripts that control transitions.
 [flow]
 start = "dispatch"
 max_retries = 10
+timeout = "2h"          # default op timeout (ops can override)
 
 [rules.no-test-write]
 files.denied = ["tests/**"]
@@ -344,6 +399,7 @@ Frontmatter fields:
 | `rules` | Rule names to activate |
 | `on` | Lifecycle hook: `success`, `failure`, `finish` |
 | `params` | Key-value pairs → `PARAM_*` env vars |
+| `timeout` | Op-level timeout override (e.g. `4h`, `30m`) |
 
 #### Hooks (middleware model)
 
@@ -410,7 +466,8 @@ fi
 | `cellx flow done` | End the flow |
 
 If no decision is made (no `result.json` in workspace), the flow fails.
-Retries are capped by `max_retries` (default: 10).
+Retries are capped by `max_retries` (default: 10). Ops that exceed their
+timeout (op-level > flow-level `timeout` > default 2h) fail the flow.
 
 #### Per-op workspace
 
@@ -526,7 +583,9 @@ them with an AI agent, validates with tests, and fixes failures:
 ```
 
 ```bash
-cella run dev -c blog -- project="personal blog"
+cella create blog
+cd .cella/trees/blog
+cella run dev -- project="personal blog"
 ```
 
 ## Anatomy
@@ -612,9 +671,10 @@ explicitly enabled.
 
 **Services:**
 - `cella-mitmproxy` — egress filtering + credential injection
-- `cella-services` — control API (flow start/stop, cell lifecycle)
+- `cella-services` — control API (flow start/stop, cell lifecycle) + sweep
 - `cella-ca-sync` — mitmproxy CA cert extraction
 - `cella-hostkey` — SSH keypair for server-side VM access
+- `cella-gc` (optional timer) — periodic garbage collection of stopped cells
 
 **Filesystem:**
 - `/var/lib/cella/` — cells, IP pool, DNS hosts, CA certs, secrets
