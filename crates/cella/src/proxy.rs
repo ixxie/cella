@@ -400,18 +400,18 @@ async fn handle_flow_start(req: &str) -> (&'static str, String) {
         };
         let detached = crate::exec::detached(&inner_cmd, "/tmp/cellx/flow.log");
         let script = format!("cd {} && {}", crate::exec::shell_escape(&workspace), detached);
-        let ssh_cmd = format!("sh -c {}", crate::exec::shell_escape(&script));
 
-        eprintln!("flow-start: target={target} cmd={ssh_cmd}");
+        eprintln!("flow-start: target={target} cmd={script}");
 
         // fire-and-forget: spawn SSH, don't wait for exit
+        // SSH already runs the command through a remote shell, so no sh -c wrapper needed
         std::process::Command::new("ssh")
             .args([
                 "-o", "StrictHostKeyChecking=no",
                 "-o", "UserKnownHostsFile=/dev/null",
                 "-o", "LogLevel=ERROR",
                 &target,
-                &ssh_cmd,
+                &script,
             ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

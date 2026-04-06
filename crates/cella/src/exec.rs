@@ -84,6 +84,24 @@ mod tests {
     }
 
     #[test]
+    fn flow_start_with_json_params() {
+        // Simulates proxy.rs handle_flow_start escaping chain (2 layers, not 3)
+        // SSH runs the script directly through the remote shell
+        let params = r#"{"project":"personal blog"}"#;
+        let flow = "dev";
+
+        let inner_cmd = format!("cellx flow run {flow} --params {}", shell_escape(params));
+        let det = detached(&inner_cmd, "/tmp/cellx/flow.log");
+        let script = format!("cd {} && {}", shell_escape("/shenhav.fyi"), det);
+
+        // script is passed directly to SSH (no sh -c wrapper)
+        // SSH's remote shell interprets it as one layer
+        eprintln!("script: {script}");
+        assert!(script.contains("--params"), "params flag present");
+        assert!(script.contains("personal blog"), "param value preserved");
+    }
+
+    #[test]
     fn double_hop_composition() {
         let user_cmd = "tail -f /tmp/cellx/flow.log 2>/dev/null || echo 'no log'";
         let server_cmd = cella_hop("feat-a", user_cmd);
