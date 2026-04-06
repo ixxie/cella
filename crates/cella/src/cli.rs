@@ -524,28 +524,28 @@ fn cmd_path(repo: &git::Repo, name: &str) -> Result<()> {
 fn cmd_hook(shell: &str) -> Result<()> {
     let hook = match shell {
         "fish" => r#"function cella
-    if test "$argv[1]" = "cd"
+    if test "$argv[1]" = "switch"
         cd (command cella path $argv[2])
     else
         command cella $argv
     end
 end"#,
         "bash" | "zsh" => r#"cella() {
-    if [ "$1" = "cd" ]; then
+    if [ "$1" = "switch" ]; then
         cd "$(command cella path "$2")"
     else
         command cella "$@"
     fi
 }"#,
         "nu" | "nushell" => r#"def --wrapped cella [...args: string] {
-    if ($args | first) == "cd" {
+    if ($args | first) == "switch" {
         cd (^cella path ($args | get 1))
     } else {
         ^cella ...$args
     }
 }"#,
         "powershell" | "pwsh" => r#"function cella {
-    if ($args[0] -eq "cd") {
+    if ($args[0] -eq "switch") {
         Set-Location (& cella.exe path $args[1])
     } else {
         & cella.exe @args
