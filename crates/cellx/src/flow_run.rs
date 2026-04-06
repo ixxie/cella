@@ -766,6 +766,7 @@ mod tests {
 
                 on: None,
                 params: HashMap::new(),
+                timeout: None,
             },
             prompt: String::new(),
         };
@@ -797,6 +798,7 @@ mod tests {
 
                 on: None,
                 params: HashMap::new(),
+                timeout: None,
             },
             prompt: String::new(),
         };
@@ -839,6 +841,7 @@ mod tests {
 
                 on: None,
                 params: HashMap::new(),
+                timeout: None,
             },
             prompt: String::new(),
         };
@@ -858,6 +861,7 @@ mod tests {
 
                 on: None,
                 params: HashMap::new(),
+                timeout: None,
             },
             prompt: String::new(),
         };
@@ -877,6 +881,7 @@ mod tests {
 
                 on: None,
                 params: HashMap::new(),
+                timeout: None,
             },
             prompt: String::new(),
         };

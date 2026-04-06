@@ -16,6 +16,7 @@ pub struct FlowConfig {
 }
 
 fn default_max_retries() -> u32 { 10 }
+fn default_timeout() -> String { "2h".to_string() }
 
 #[derive(Debug, Deserialize)]
 pub struct FlowMeta {
@@ -23,6 +24,9 @@ pub struct FlowMeta {
     pub state: Option<String>,
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
+    /// Default op timeout for this flow (e.g. "2h", "30m"). Ops can override.
+    #[serde(default = "default_timeout")]
+    pub timeout: String,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -57,6 +61,8 @@ pub struct OpFrontmatter {
     pub on: Option<Lifecycle>,
     #[serde(default)]
     pub params: HashMap<String, String>,
+    /// Op-level timeout override (e.g. "4h", "30m"). Falls back to flow timeout.
+    pub timeout: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]
@@ -255,6 +261,12 @@ pub fn op_allows(op: &Op, target: &str) -> bool {
     op.config.next.iter().any(|n| n == target)
 }
 
+/// Resolve effective timeout in seconds: op override > flow default.
+pub fn resolve_timeout(op: &OpFrontmatter, flow: &FlowMeta) -> Option<u64> {
+    let raw = op.timeout.as_deref().unwrap_or(&flow.timeout);
+    parse_duration(raw)
+}
+
 pub fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -370,6 +382,7 @@ mod tests {
                 next: vec!["validate".to_string(), "implement".to_string()],
                 on: None,
                 params: HashMap::new(),
+                timeout: None,
             },
             prompt: String::new(),
         };
