@@ -79,6 +79,9 @@ struct CreateArgs {
     /// Server to use
     #[arg(short, long)]
     server: Option<String>,
+    /// Don't switch to the worktree after creation
+    #[arg(long)]
+    no_switch: bool,
 }
 
 #[derive(Args, Debug)]
@@ -469,6 +472,9 @@ fn cmd_create(repo: &git::Repo, args: CreateArgs) -> Result<()> {
     println!("  {} worktree at {}", add(), dim(&path.display().to_string()));
 
     println!("{} created {}", ok(), bold(name));
+    if !args.no_switch {
+        println!("__cella_cd:{}", path.display());
+    }
     Ok(())
 }
 
@@ -532,7 +538,13 @@ fn cmd_hook(shell: &str) -> Result<()> {
             cd (string replace -r '/\.cella/trees/.*' '' $cwd)
         end
     else
-        command cella $argv
+        command cella $argv | while read -l line
+            if string match -q '__cella_cd:*' $line
+                cd (string replace '__cella_cd:' '' $line)
+            else
+                echo $line
+            end
+        end
     end
 end"#,
         "bash" | "zsh" => r#"cella() {
@@ -543,7 +555,13 @@ end"#,
             */.cella/trees/*) cd "${PWD%%/.cella/trees/*}" ;;
         esac
     else
-        command cella "$@"
+        local line
+        command cella "$@" | while IFS= read -r line; do
+            case "$line" in
+                __cella_cd:*) cd "${line#__cella_cd:}" ;;
+                *) printf '%s\n' "$line" ;;
+            esac
+        done
     fi
 }"#,
         "nu" | "nushell" => r#"def --wrapped cella [...args: string] {
@@ -555,7 +573,14 @@ end"#,
             cd ($cwd | str replace -r '/\.cella/trees/.*' '')
         }
     } else {
-        ^cella ...$args
+        let output = (^cella ...$args | lines)
+        for line in $output {
+            if ($line | str starts-with "__cella_cd:") {
+                cd ($line | str replace "__cella_cd:" "")
+            } else {
+                print $line
+            }
+        }
     }
 }"#,
         "powershell" | "pwsh" => r#"function cella {
@@ -567,7 +592,13 @@ end"#,
             Set-Location ($cwd -replace '[\\/]\.cella[\\/]trees[\\/].*', '')
         }
     } else {
-        & cella.exe @args
+        & cella.exe @args | ForEach-Object {
+            if ($_ -match '^__cella_cd:(.+)$') {
+                Set-Location $Matches[1]
+            } else {
+                $_
+            }
+        }
     }
 }"#,
         _ => anyhow::bail!("unsupported shell '{shell}' — use fish, bash, zsh, nu, or powershell"),
