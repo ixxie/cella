@@ -517,8 +517,13 @@ async fn handle_flow_logs_follow(
     // send chunked transfer header
     let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n").await;
 
-    // Execute tail -f via russh exec channel and pipe output
-    let tail_cmd = "tail -f /tmp/cellx/flow.log 2>/dev/null & TAIL=$!; while kill -0 $TAIL 2>/dev/null; do if [ ! -f /tmp/cellx/flow.json ]; then kill $TAIL 2>/dev/null; break; fi; sleep 1; done; wait $TAIL 2>/dev/null";
+    // Wait for log file, then stream it
+    let tail_cmd = concat!(
+        "for i in $(seq 1 30); do [ -f /tmp/cellx/flow.log ] && break; sleep 1; done; ",
+        "[ -f /tmp/cellx/flow.log ] || exit 1; ",
+        "exec tail -n 100 -f /tmp/cellx/flow.log"
+    );
+
     let mut channel = match session.handle.channel_open_session().await {
         Ok(c) => c,
         Err(_) => return,
@@ -529,18 +534,16 @@ async fn handle_flow_logs_follow(
 
     // Pipe channel data as chunked HTTP
     while let Some(msg) = channel.wait().await {
-        if let russh::ChannelMsg::Data { ref data } = msg {
-            let chunk_header = format!("{:x}\r\n", data.len());
-            if stream.write_all(chunk_header.as_bytes()).await.is_err() {
-                break;
+        match msg {
+            russh::ChannelMsg::Data { ref data } => {
+                let chunk_header = format!("{:x}\r\n", data.len());
+                if stream.write_all(chunk_header.as_bytes()).await.is_err() { break; }
+                if stream.write_all(data).await.is_err() { break; }
+                if stream.write_all(b"\r\n").await.is_err() { break; }
+                stream.flush().await.ok();
             }
-            if stream.write_all(data).await.is_err() {
-                break;
-            }
-            if stream.write_all(b"\r\n").await.is_err() {
-                break;
-            }
-            stream.flush().await.ok();
+            russh::ChannelMsg::Eof => break,
+            _ => {}
         }
     }
 

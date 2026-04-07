@@ -167,8 +167,6 @@ impl Client {
     }
 
     pub fn flow_logs_follow(&self, name: &str) -> Result<()> {
-        // For now, use polling — streaming through direct-tcpip requires
-        // chunked transfer parsing which we can add later
         let body = serde_json::json!({ "name": name, "follow": true });
         let body_str = body.to_string();
 
@@ -185,29 +183,53 @@ impl Client {
             channel.data(req.as_bytes()).await?;
             channel.eof().await?;
 
+            // Collect all data from the channel, parse chunked encoding
+            let mut buf = Vec::new();
             let mut past_headers = false;
-            let mut header_buf = Vec::new();
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
 
             while let Some(msg) = channel.wait().await {
                 match msg {
                     russh::ChannelMsg::Data { ref data } => {
+                        buf.extend_from_slice(data);
+
+                        // Skip HTTP headers
                         if !past_headers {
-                            header_buf.extend_from_slice(data);
-                            if let Some(pos) = header_buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
                                 past_headers = true;
-                                let after = &header_buf[pos + 4..];
-                                if !after.is_empty() {
-                                    out.write_all(after).ok();
-                                    out.flush().ok();
-                                }
+                                buf = buf[pos + 4..].to_vec();
+                            } else {
+                                continue;
                             }
-                        } else {
-                            out.write_all(data).ok();
+                        }
+
+                        // Parse chunked encoding from buffer
+                        loop {
+                            // Find chunk size line
+                            let line_end = match buf.windows(2).position(|w| w == b"\r\n") {
+                                Some(p) => p,
+                                None => break,
+                            };
+                            let size_str = String::from_utf8_lossy(&buf[..line_end]);
+                            let chunk_size = match usize::from_str_radix(size_str.trim(), 16) {
+                                Ok(s) => s,
+                                Err(_) => break,
+                            };
+                            if chunk_size == 0 {
+                                return Ok(());
+                            }
+                            let chunk_start = line_end + 2;
+                            let chunk_end = chunk_start + chunk_size;
+                            if buf.len() < chunk_end + 2 {
+                                break; // need more data
+                            }
+                            out.write_all(&buf[chunk_start..chunk_end]).ok();
                             out.flush().ok();
+                            buf = buf[chunk_end + 2..].to_vec(); // skip trailing \r\n
                         }
                     }
+                    russh::ChannelMsg::Eof => break,
                     _ => {}
                 }
             }
