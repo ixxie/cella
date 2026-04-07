@@ -331,8 +331,9 @@ fn run_hook(
     }
 
     // inject transition params from previous op
-    if let Some(tp) = transition_params {
-        cmd.env("OP_PARAMS", tp.to_string());
+    match transition_params {
+        Some(tp) => { cmd.env("OP_PARAMS", tp.to_string()); }
+        None => { cmd.env("OP_PARAMS", ""); }
     }
 
     if let Some(code) = exit_code {

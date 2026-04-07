@@ -51,22 +51,15 @@ impl Session {
         // server-side key (systemd services may not have HOME set)
         key_paths.push("/var/lib/cella/ssh/id_ed25519".to_string());
         for path in &key_paths {
-            match keys::load_secret_key(path, None) {
-                Ok(key) => {
-                    let key = keys::key::PrivateKeyWithHashAlg::new(Arc::new(key), None);
-                    let result = handle.authenticate_publickey(&user, key).await;
-                    eprintln!("ssh: key {path} → {result:?}");
-                    if let Ok(client::AuthResult::Success) = result {
-                        return Ok(Self { handle });
-                    }
-                }
-                Err(e) => {
-                    eprintln!("ssh: key {path} load failed: {e}");
+            if let Ok(key) = keys::load_secret_key(path, None) {
+                let key = keys::key::PrivateKeyWithHashAlg::new(Arc::new(key), None);
+                if let Ok(client::AuthResult::Success) = handle.authenticate_publickey(&user, key).await {
+                    return Ok(Self { handle });
                 }
             }
         }
 
-        anyhow::bail!("SSH authentication failed for {user_host} (tried: {key_paths:?})")
+        anyhow::bail!("SSH authentication failed for {user_host}")
     }
 
     /// Execute a command and return (stdout, exit_code).
