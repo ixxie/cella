@@ -167,74 +167,48 @@ impl Client {
     }
 
     pub fn flow_logs_follow(&self, name: &str) -> Result<()> {
-        let body = serde_json::json!({ "name": name, "follow": true });
-        let body_str = body.to_string();
+        use std::io::Write;
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        let mut seen_lines = 0usize;
 
-        self.rt.block_on(async {
-            let mut channel = self.session.handle
-                .channel_open_direct_tcpip("127.0.0.1", CONTROL_PORT, "127.0.0.1", 0)
-                .await
-                .context("failed to open channel")?;
+        loop {
+            let content = self.flow_logs(name, 500)?;
+            let lines: Vec<&str> = content.lines().collect();
+            let total = lines.len();
 
-            let req = format!(
-                "POST /flow/logs HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body_str}",
-                body_str.len(),
-            );
-            channel.data(req.as_bytes()).await?;
-            channel.eof().await?;
-
-            // Collect all data from the channel, parse chunked encoding
-            let mut buf = Vec::new();
-            let mut past_headers = false;
-            let stdout = std::io::stdout();
-            let mut out = stdout.lock();
-
-            while let Some(msg) = channel.wait().await {
-                match msg {
-                    russh::ChannelMsg::Data { ref data } => {
-                        buf.extend_from_slice(data);
-
-                        // Skip HTTP headers
-                        if !past_headers {
-                            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                                past_headers = true;
-                                buf = buf[pos + 4..].to_vec();
-                            } else {
-                                continue;
-                            }
-                        }
-
-                        // Parse chunked encoding from buffer
-                        loop {
-                            // Find chunk size line
-                            let line_end = match buf.windows(2).position(|w| w == b"\r\n") {
-                                Some(p) => p,
-                                None => break,
-                            };
-                            let size_str = String::from_utf8_lossy(&buf[..line_end]);
-                            let chunk_size = match usize::from_str_radix(size_str.trim(), 16) {
-                                Ok(s) => s,
-                                Err(_) => break,
-                            };
-                            if chunk_size == 0 {
-                                return Ok(());
-                            }
-                            let chunk_start = line_end + 2;
-                            let chunk_end = chunk_start + chunk_size;
-                            if buf.len() < chunk_end + 2 {
-                                break; // need more data
-                            }
-                            out.write_all(&buf[chunk_start..chunk_end]).ok();
-                            out.flush().ok();
-                            buf = buf[chunk_end + 2..].to_vec(); // skip trailing \r\n
-                        }
-                    }
-                    russh::ChannelMsg::Eof => break,
-                    _ => {}
+            if total > seen_lines {
+                for line in &lines[seen_lines..] {
+                    writeln!(out, "{line}").ok();
                 }
+                out.flush().ok();
+                seen_lines = total;
             }
-            Ok::<(), anyhow::Error>(())
-        })?;
+
+            // Check if flow is still running
+            let status = self.list()?;
+            let cell = status.iter().find(|c| c.name == name);
+            match cell {
+                Some(c) => {
+                    if let Some(ref f) = c.flow {
+                        if f.state != "running" && f.state != "paused" {
+                            // Print remaining lines
+                            let content = self.flow_logs(name, 500)?;
+                            let lines: Vec<&str> = content.lines().collect();
+                            for line in &lines[seen_lines..] {
+                                writeln!(out, "{line}").ok();
+                            }
+                            break;
+                        }
+                    } else {
+                        break; // no flow running
+                    }
+                }
+                None => break,
+            }
+
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
         Ok(())
     }
 
