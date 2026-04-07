@@ -526,6 +526,11 @@ fn cmd_hook(shell: &str) -> Result<()> {
         "fish" => r#"function cella
     if test "$argv[1]" = "switch"
         cd (command cella path $argv[2])
+    else if test "$argv[1]" = "exit"
+        set -l cwd (pwd)
+        if string match -q '*/.cella/trees/*' $cwd
+            cd (string replace -r '/\.cella/trees/.*' '' $cwd)
+        end
     else
         command cella $argv
     end
@@ -533,6 +538,10 @@ end"#,
         "bash" | "zsh" => r#"cella() {
     if [ "$1" = "switch" ]; then
         cd "$(command cella path "$2")"
+    elif [ "$1" = "exit" ]; then
+        case "$PWD" in
+            */.cella/trees/*) cd "${PWD%%/.cella/trees/*}" ;;
+        esac
     else
         command cella "$@"
     fi
@@ -540,6 +549,11 @@ end"#,
         "nu" | "nushell" => r#"def --wrapped cella [...args: string] {
     if ($args | first) == "switch" {
         cd (^cella path ($args | get 1))
+    } else if ($args | first) == "exit" {
+        let cwd = (pwd)
+        if ($cwd | str contains "/.cella/trees/") {
+            cd ($cwd | str replace -r '/\.cella/trees/.*' '')
+        }
     } else {
         ^cella ...$args
     }
@@ -547,6 +561,11 @@ end"#,
         "powershell" | "pwsh" => r#"function cella {
     if ($args[0] -eq "switch") {
         Set-Location (& cella.exe path $args[1])
+    } elseif ($args[0] -eq "exit") {
+        $cwd = Get-Location
+        if ($cwd -match '[\\/]\.cella[\\/]trees[\\/]') {
+            Set-Location ($cwd -replace '[\\/]\.cella[\\/]trees[\\/].*', '')
+        }
     } else {
         & cella.exe @args
     }
