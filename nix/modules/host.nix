@@ -246,7 +246,7 @@ in {
       description = "Cella Git Credentials + Control API";
       wantedBy = ["multi-user.target"];
       after = ["network.target"];
-      path = [pkgs.git pkgs.sudo pkgs.util-linux pkgs.systemd pkgs.openssh pkgs.curl pkgs.nix];
+      path = [pkgs.git pkgs.sudo pkgs.util-linux pkgs.systemd pkgs.openssh pkgs.curl pkgs.nix pkgs.age];
       serviceConfig = {
         ExecStart = "${pkgs.cella}/bin/cella server proxy --config /etc/cella/proxy-config.json";
         Restart = "always";
