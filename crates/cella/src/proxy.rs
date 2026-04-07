@@ -269,6 +269,11 @@ async fn handle_up(req: &str) -> (&'static str, String) {
 
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
         crate::git::init_clone_server(&up.name, &up.config)?;
+
+        // decrypt secrets from cell repo if available
+        let cell_repo = crate::cell::cell_dir(&up.name).join("repo");
+        crate::secrets::resolve(&up.name, &cell_repo, &up.config).ok();
+
         if !crate::vm::is_running(&up.name)? {
             let repo_name = up.repo.as_deref().unwrap_or("unknown");
             crate::vm::start(&up.name, repo_name, &up.config)?;
