@@ -27,6 +27,9 @@ pub struct FlowMeta {
     /// Default op timeout for this flow (e.g. "2h", "30m"). Ops can override.
     #[serde(default = "default_timeout")]
     pub timeout: String,
+    /// Required flow-level params (validated before cell boot)
+    #[serde(default)]
+    pub requires: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -63,6 +66,9 @@ pub struct OpFrontmatter {
     pub params: HashMap<String, String>,
     /// Op-level timeout override (e.g. "4h", "30m"). Falls back to flow timeout.
     pub timeout: Option<String>,
+    /// Required keys in OP_PARAMS (validated before op runs)
+    #[serde(default)]
+    pub requires: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]
@@ -383,6 +389,7 @@ mod tests {
                 on: None,
                 params: HashMap::new(),
                 timeout: None,
+                requires: vec![],
             },
             prompt: String::new(),
         };

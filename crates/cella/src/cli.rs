@@ -1057,6 +1057,50 @@ fn cmd_secrets(repo: &git::Repo, args: SecretsArgs) -> Result<()> {
 fn cmd_run(repo: &git::Repo, cell: &str, args: RunArgs) -> Result<()> {
     let cfg = config::load(repo.root())?;
 
+    // Parse params early so we can validate before booting
+    let params_json = if args.params.is_empty() {
+        None
+    } else {
+        let mut map = serde_json::Map::new();
+        for kv in &args.params {
+            if let Some((k, v)) = kv.split_once('=') {
+                map.insert(k.to_string(), serde_json::Value::String(v.to_string()));
+            } else {
+                anyhow::bail!("invalid param '{}' — expected key=value", kv);
+            }
+        }
+        Some(serde_json::Value::Object(map))
+    };
+
+    // Resolve flow name early for validation
+    let flow_name = if let Some(ref name) = args.name {
+        name.clone()
+    } else {
+        anyhow::bail!("specify a flow name: cella run <flow>")
+    };
+
+    // Validate required flow params before booting
+    if let Ok(flow_config) = flow::load_flow(repo.root(), &flow_name) {
+        if !flow_config.flow.requires.is_empty() {
+            let provided: Vec<String> = params_json.as_ref()
+                .and_then(|v| v.as_object())
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default();
+            let missing: Vec<&str> = flow_config.flow.requires.iter()
+                .filter(|r| !provided.contains(r))
+                .map(|s| s.as_str())
+                .collect();
+            if !missing.is_empty() {
+                anyhow::bail!(
+                    "flow '{}' requires params: {} (use -- {})",
+                    flow_name,
+                    missing.join(", "),
+                    missing.iter().map(|k| format!("{k}=\"...\"")).collect::<Vec<_>>().join(" "),
+                );
+            }
+        }
+    }
+
     let client_cfg = server::load_client_config();
     let srv_name = args.server.as_ref()
         .or(cfg.server.as_ref())
@@ -1070,46 +1114,8 @@ fn cmd_run(repo: &git::Repo, cell: &str, args: RunArgs) -> Result<()> {
     let t = make_transport(&active)?;
     t.ensure_running(cell, repo, &cfg)?;
 
-    let flow_name = if let Some(ref name) = args.name {
-        name.clone()
-    } else {
-        let status_path = if active.is_server() {
-            None
-        } else {
-            Some(crate::cell::cell_dir(cell).join("flow-status.json"))
-        };
-
-        let paused_flow = status_path
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .and_then(|v| {
-                if v["state"].as_str() == Some("paused") {
-                    v["flow_name"].as_str().map(|s| s.to_string())
-                } else {
-                    None
-                }
-            });
-
-        match paused_flow {
-            Some(name) => name,
-            None => anyhow::bail!("specify a flow name: cella run <flow>"),
-        }
-    };
-
-    let params_json = if args.params.is_empty() {
-        None
-    } else {
-        let mut map = serde_json::Map::new();
-        for kv in &args.params {
-            if let Some((k, v)) = kv.split_once('=') {
-                map.insert(k.to_string(), serde_json::Value::String(v.to_string()));
-            } else {
-                anyhow::bail!("invalid param '{}' — expected key=value", kv);
-            }
-        }
-        Some(serde_json::Value::Object(map).to_string())
-    };
-    t.flow_start(cell, &flow_name, params_json.as_deref())?;
+    let params_str = params_json.as_ref().map(|v| v.to_string());
+    t.flow_start(cell, &flow_name, params_str.as_deref())?;
     println!("{} flow {} on {}", arrow(), bold(&flow_name), bold(cell));
     if args.detach {
         println!("  {} cella logs -f", dim("follow:"));

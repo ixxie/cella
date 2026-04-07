@@ -533,6 +533,23 @@ fn run_loop(
             return FlowOutcome::Failure(format!("op '{current_op}' is a lifecycle op, not a regular op"));
         }
 
+        // Validate required params
+        if !op.config.requires.is_empty() {
+            let provided: Vec<String> = transition_params.as_ref()
+                .and_then(|v| v.as_object())
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default();
+            let missing: Vec<&str> = op.config.requires.iter()
+                .filter(|r| !provided.contains(r))
+                .map(|s| s.as_str())
+                .collect();
+            if !missing.is_empty() {
+                return FlowOutcome::Failure(
+                    format!("op '{}' requires params: {}", current_op, missing.join(", "))
+                );
+            }
+        }
+
         // Resolve and apply rules
         let resolved = resolve_op_rules(&op, &flow_config.rules, cell_rules);
         if let Some(ip) = cell_ip {
@@ -778,6 +795,7 @@ mod tests {
                 on: None,
                 params: HashMap::new(),
                 timeout: None,
+                requires: vec![],
             },
             prompt: String::new(),
         };
@@ -810,6 +828,7 @@ mod tests {
                 on: None,
                 params: HashMap::new(),
                 timeout: None,
+                requires: vec![],
             },
             prompt: String::new(),
         };
@@ -853,6 +872,7 @@ mod tests {
                 on: None,
                 params: HashMap::new(),
                 timeout: None,
+                requires: vec![],
             },
             prompt: String::new(),
         };
@@ -873,6 +893,7 @@ mod tests {
                 on: None,
                 params: HashMap::new(),
                 timeout: None,
+                requires: vec![],
             },
             prompt: String::new(),
         };
@@ -893,6 +914,7 @@ mod tests {
                 on: None,
                 params: HashMap::new(),
                 timeout: None,
+                requires: vec![],
             },
             prompt: String::new(),
         };
