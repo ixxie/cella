@@ -375,10 +375,21 @@ async fn handle_list() -> (&'static str, String) {
     }
 }
 
-/// Connect to a cell VM via russh
+/// Connect to a cell VM via russh, with retries for boot timing
 async fn cell_session(name: &str) -> anyhow::Result<crate::ssh::Session> {
     let (_, target) = crate::vm::ssh_target(name)?;
-    crate::ssh::Session::connect(&target).await
+    for attempt in 0..10 {
+        match crate::ssh::Session::connect(&target).await {
+            Ok(s) => return Ok(s),
+            Err(e) => {
+                if attempt == 9 {
+                    return Err(e);
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+    }
+    unreachable!()
 }
 
 async fn handle_flow_start(req: &str) -> (&'static str, String) {
