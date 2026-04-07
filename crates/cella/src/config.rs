@@ -33,7 +33,8 @@ pub struct HooksConfig {
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct SecretsConfig {
     pub command: Option<String>,
-    pub recipient: Option<String>,
+    #[serde(default)]
+    pub keys: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]

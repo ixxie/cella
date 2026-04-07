@@ -12,29 +12,40 @@ fn secrets_env_path(repo_root: &Path) -> PathBuf {
     repo_root.join(".cella/secrets.env")
 }
 
-fn ssh_key_path() -> PathBuf {
+fn ssh_key_paths() -> Vec<PathBuf> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    let ed = PathBuf::from(&home).join(".ssh/id_ed25519");
-    if ed.exists() { return ed; }
-    PathBuf::from(&home).join(".ssh/id_rsa")
+    let mut paths = vec![
+        PathBuf::from(&home).join(".ssh/id_ed25519"),
+        PathBuf::from(&home).join(".ssh/id_rsa"),
+    ];
+    // server-side key
+    paths.push(PathBuf::from("/var/lib/cella/ssh/id_ed25519"));
+    paths.retain(|p| p.exists());
+    paths
 }
 
 fn decrypt(age_file: &Path) -> Result<String> {
-    let key = ssh_key_path();
-    let output = Command::new("age")
-        .args(["-d", "-i"])
-        .arg(&key)
-        .arg(age_file)
-        .output()
-        .context("failed to run age — is it installed?")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("age decryption failed: {stderr}");
+    let keys = ssh_key_paths();
+    if keys.is_empty() {
+        anyhow::bail!("no SSH keys found for decryption");
     }
-    Ok(String::from_utf8(output.stdout)?)
+
+    for key in &keys {
+        let output = Command::new("age")
+            .args(["-d", "-i"])
+            .arg(key)
+            .arg(age_file)
+            .output()
+            .context("failed to run age — is it installed?")?;
+        if output.status.success() {
+            return Ok(String::from_utf8(output.stdout)?);
+        }
+    }
+
+    anyhow::bail!("age decryption failed — no key matched any recipient")
 }
 
-/// Resolve secrets for a cell. Returns path to a secrets.env file if secrets are available.
+/// Resolve secrets for a cell.
 pub fn resolve(_name: &str, repo_root: &Path, config: &CellaConfig) -> Result<Option<PathBuf>> {
     let env_content = if let Some(ref cmd) = config.secrets.command {
         let output = Command::new("sh")
@@ -72,20 +83,25 @@ pub fn resolve(_name: &str, repo_root: &Path, config: &CellaConfig) -> Result<Op
     }
 }
 
-/// Encrypt .cella/secrets.env → .cella/secrets.age using a recipient key.
-pub fn encrypt(repo_root: &Path, recipient: &str) -> Result<()> {
+/// Encrypt .cella/secrets.env → .cella/secrets.age for all keys.
+pub fn encrypt(repo_root: &Path, keys: &[String]) -> Result<()> {
+    if keys.is_empty() {
+        anyhow::bail!("no keys configured — add secrets.keys in .cella/config.toml");
+    }
+
     let env_file = secrets_env_path(repo_root);
     if !env_file.exists() {
         anyhow::bail!(".cella/secrets.env not found — create it first");
     }
 
     let age_file = secrets_age_path(repo_root);
-    let output = Command::new("age")
-        .args(["-r", recipient, "-o"])
-        .arg(&age_file)
-        .arg(&env_file)
-        .output()
-        .context("failed to run age — is it installed?")?;
+    let mut cmd = Command::new("age");
+    for key in keys {
+        cmd.args(["-r", key]);
+    }
+    cmd.arg("-o").arg(&age_file).arg(&env_file);
+
+    let output = cmd.output().context("failed to run age — is it installed?")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("age encryption failed: {stderr}");
@@ -94,19 +110,21 @@ pub fn encrypt(repo_root: &Path, recipient: &str) -> Result<()> {
     Ok(())
 }
 
-/// Decrypt .cella/secrets.age to a temp file, open $EDITOR, re-encrypt on save.
-pub fn edit(repo_root: &Path, recipient: &str) -> Result<()> {
+/// Decrypt .cella/secrets.age, open $EDITOR, re-encrypt on save.
+pub fn edit(repo_root: &Path, keys: &[String]) -> Result<()> {
+    if keys.is_empty() {
+        anyhow::bail!("no keys configured — add secrets.keys in .cella/config.toml");
+    }
+
     let age_file = secrets_age_path(repo_root);
     let env_file = secrets_env_path(repo_root);
 
-    // decrypt existing or start fresh
     let content = if age_file.exists() {
         decrypt(&age_file)?
     } else {
         String::new()
     };
 
-    // write to .cella/secrets.env for editing
     std::fs::create_dir_all(repo_root.join(".cella"))?;
     std::fs::write(&env_file, &content)?;
 
@@ -119,10 +137,8 @@ pub fn edit(repo_root: &Path, recipient: &str) -> Result<()> {
         anyhow::bail!("editor exited with {}", status);
     }
 
-    // re-encrypt
-    encrypt(repo_root, recipient)?;
+    encrypt(repo_root, keys)?;
 
-    // remove plaintext
     std::fs::remove_file(&env_file).ok();
     Ok(())
 }

@@ -219,17 +219,9 @@ struct SecretsArgs {
 #[derive(Subcommand)]
 enum SecretsAction {
     /// Encrypt .cella/secrets.env → .cella/secrets.age
-    Encrypt {
-        /// Recipient public key (overrides config)
-        #[arg(short, long)]
-        recipient: Option<String>,
-    },
+    Encrypt,
     /// Decrypt, open in $EDITOR, re-encrypt on save
-    Edit {
-        /// Recipient public key (overrides config)
-        #[arg(short, long)]
-        recipient: Option<String>,
-    },
+    Edit,
 }
 
 #[derive(Args)]
@@ -1066,19 +1058,10 @@ fn cmd_logs(repo: &git::Repo, cell: &str, args: LogsArgs) -> Result<()> {
 
 fn cmd_secrets(repo: &git::Repo, args: SecretsArgs) -> Result<()> {
     let cfg = config::load(repo.root())?;
-    let resolve_recipient = |arg: Option<String>| -> Result<String> {
-        arg.or(cfg.secrets.recipient.clone())
-            .ok_or_else(|| anyhow::anyhow!(
-                "no recipient — pass -r or set secrets.recipient in config"
-            ))
-    };
+    let keys = &cfg.secrets.keys;
     match args.action {
-        SecretsAction::Encrypt { recipient } => {
-            secrets::encrypt(repo.root(), &resolve_recipient(recipient)?)
-        }
-        SecretsAction::Edit { recipient } => {
-            secrets::edit(repo.root(), &resolve_recipient(recipient)?)
-        }
+        SecretsAction::Encrypt => secrets::encrypt(repo.root(), keys),
+        SecretsAction::Edit => secrets::edit(repo.root(), keys),
     }
 }
 
