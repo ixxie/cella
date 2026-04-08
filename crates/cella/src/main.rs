@@ -24,7 +24,11 @@ fn main() -> Result<()> {
     if argv0.ends_with("git-remote-cella") {
         remote::run()
     } else {
-        log::init();
+        // skip log::init for secrets commands (background log thread crashes some terminals)
+        let is_secrets = std::env::args().nth(1).as_deref() == Some("secrets");
+        if !is_secrets {
+            log::init();
+        }
         cli::run()
     }
 }
