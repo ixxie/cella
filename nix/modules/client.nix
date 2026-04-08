@@ -48,6 +48,8 @@ in {
   };
 
   config = mkIf cfg.enable {
+    environment.systemPackages = [pkgs.age];
+
     # Write server registry and deploy localhost vm-config
     system.activationScripts.cella-client = let
       registry = concatStringsSep "\n" (mapAttrsToList (name: target: ''
