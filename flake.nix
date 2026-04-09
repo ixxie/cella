@@ -104,3 +104,4 @@
       nixosModules.client = ./nix/modules/client.nix;
     };
 }
+# v2
