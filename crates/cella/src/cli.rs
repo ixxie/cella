@@ -1,3 +1,4 @@
+use std::path::Path;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use console::{style, Style};
@@ -451,6 +452,15 @@ fn cmd_init(repo: &git::Repo) -> Result<()> {
 
 // Branch lifecycle commands
 
+/// Signal the shell hook to cd into a worktree.
+/// Uses CELLA_CD_FILE (tempfile set by the shell hook) so cella's stdout
+/// is never piped — interactive commands like `secrets edit` get a real tty.
+fn emit_cd(path: &Path) {
+    if let Ok(f) = std::env::var("CELLA_CD_FILE") {
+        std::fs::write(f, path.display().to_string()).ok();
+    }
+}
+
 fn cmd_create(repo: &git::Repo, args: CreateArgs) -> Result<()> {
     let name = &args.name;
     if repo.branch_exists(name) {
@@ -465,7 +475,7 @@ fn cmd_create(repo: &git::Repo, args: CreateArgs) -> Result<()> {
 
     println!("{} created {}", ok(), bold(name));
     if !args.no_switch {
-        println!("__cella_cd:{}", path.display());
+        emit_cd(&path);
     }
     Ok(())
 }
@@ -530,13 +540,15 @@ fn cmd_hook(shell: &str) -> Result<()> {
             cd (string replace -r '/\.cella/trees/.*' '' $cwd)
         end
     else
-        command cella $argv | while read -l line
-            if string match -q '__cella_cd:*' $line
-                cd (string replace '__cella_cd:' '' $line)
-            else
-                echo $line
-            end
+        set -l cdfile (mktemp)
+        set -lx CELLA_CD_FILE $cdfile
+        command cella $argv
+        set -l s $status
+        if test -s $cdfile
+            cd (cat $cdfile)
         end
+        rm -f $cdfile
+        return $s
     end
 end"#,
         "bash" | "zsh" => r#"cella() {
@@ -547,13 +559,15 @@ end"#,
             */.cella/trees/*) cd "${PWD%%/.cella/trees/*}" ;;
         esac
     else
-        local line
-        command cella "$@" | while IFS= read -r line; do
-            case "$line" in
-                __cella_cd:*) cd "${line#__cella_cd:}" ;;
-                *) printf '%s\n' "$line" ;;
-            esac
-        done
+        local cdfile
+        cdfile=$(mktemp)
+        CELLA_CD_FILE="$cdfile" command cella "$@"
+        local s=$?
+        if [ -s "$cdfile" ]; then
+            cd "$(cat "$cdfile")"
+        fi
+        rm -f "$cdfile"
+        return $s
     fi
 }"#,
         "nu" | "nushell" => r#"def --wrapped cella [...args: string] {
@@ -565,13 +579,12 @@ end"#,
             cd ($cwd | str replace -r '/\.cella/trees/.*' '')
         }
     } else {
-        let output = (^cella ...$args | lines)
-        for line in $output {
-            if ($line | str starts-with "__cella_cd:") {
-                cd ($line | str replace "__cella_cd:" "")
-            } else {
-                print $line
-            }
+        let cdfile = (mktemp)
+        with-env { CELLA_CD_FILE: $cdfile } { ^cella ...$args }
+        let cdpath = (open $cdfile --raw | str trim)
+        rm -f $cdfile
+        if not ($cdpath | is-empty) {
+            cd $cdpath
         }
     }
 }"#,
@@ -584,11 +597,15 @@ end"#,
             Set-Location ($cwd -replace '[\\/]\.cella[\\/]trees[\\/].*', '')
         }
     } else {
-        & cella.exe @args | ForEach-Object {
-            if ($_ -match '^__cella_cd:(.+)$') {
-                Set-Location $Matches[1]
-            } else {
-                $_
+        $cdfile = [System.IO.Path]::GetTempFileName()
+        $env:CELLA_CD_FILE = $cdfile
+        & cella.exe @args
+        $env:CELLA_CD_FILE = $null
+        if (Test-Path $cdfile) {
+            $cdpath = Get-Content $cdfile -ErrorAction SilentlyContinue
+            Remove-Item $cdfile -Force -ErrorAction SilentlyContinue
+            if ($cdpath) {
+                Set-Location $cdpath
             }
         }
     }
